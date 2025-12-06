@@ -7,6 +7,11 @@ app.use(express.json());
 app.post("/webhook", (req, res) => {
   console.log("🔔 Webhook received:", req.body);
 
+  // ひとまず 200 OK を返す
+  res.status(200).json({ status: "ok" });
+});
+
+// ▼▼ ここから追加：注文取得ダミーAPI ▼▼
 app.get("/orders", (req, res) => {
   // 本番ではここを Amazon SP-API の getOrders に差し替える
   const dummyOrders = [

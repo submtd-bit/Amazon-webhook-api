@@ -73,6 +73,105 @@ app.get("/orders", async (req, res) => {
         .json({ error: "Orders API error", status: ordersRes.status, body: text });
     }
 
+// 既にある共通設定・getLwaAccessToken・/orders の下あたりに追加
+
+// ---- 出荷通知API（佐川の伝票番号を使って confirmShipment） ----
+app.post("/confirm-shipment", async (req, res) => {
+  try {
+    const { orderId, trackingNumber } = req.body;
+
+    if (!orderId || !trackingNumber) {
+      return res.status(400).json({ error: "orderId と trackingNumber は必須です" });
+    }
+
+    // 1) LWAアクセストークン
+    const accessToken = await getLwaAccessToken();
+
+    // 2) 注文の明細（orderItemId と quantity）を取得
+    const itemsRes = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(
+        orderId
+      )}/orderItems`,
+      {
+        method: "GET",
+        headers: {
+          "x-amz-access-token": accessToken,
+          accept: "application/json",
+        },
+      }
+    );
+
+    if (!itemsRes.ok) {
+      const text = await itemsRes.text();
+      console.error("❌ getOrderItems error:", itemsRes.status, text);
+      return res
+        .status(itemsRes.status)
+        .json({ error: "getOrderItems error", status: itemsRes.status, body: text });
+    }
+
+    const itemsJson = await itemsRes.json();
+    const orderItems = itemsJson.OrderItems || [];
+
+    if (orderItems.length === 0) {
+      return res.status(400).json({ error: "orderItems が取得できませんでした" });
+    }
+
+    // 3) confirmShipment リクエストボディを構築
+    const shipDate = new Date().toISOString();
+    const packageDetail = {
+      packageReferenceId: "1",
+      carrierCode: "SAGAWA",            // 佐川急便
+      carrierName: "SAGAWA EXPRESS",    // 任意（表示用）
+      shippingMethod: "Hikyaku",        // 任意。空でも可
+      trackingNumber,
+      shipDate,
+      orderItems: orderItems.map((oi) => ({
+        orderItemId: oi.OrderItemId,
+        quantity: oi.QuantityOrdered, // 全数量を一度に出荷する前提
+      })),
+    };
+
+    const body = {
+      marketplaceId: MARKETPLACE_ID,
+      packageDetail,
+    };
+
+    // 4) confirmShipment 呼び出し
+    const confirmRes = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(
+        orderId
+      )}/shipmentConfirmation`,
+      {
+        method: "POST",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    if (!confirmRes.ok) {
+      const text = await confirmRes.text();
+      console.error("❌ confirmShipment error:", confirmRes.status, text);
+      return res
+        .status(confirmRes.status)
+        .json({ error: "confirmShipment error", status: confirmRes.status, body: text });
+    }
+
+    const respBody = await confirmRes.text(); // 204の場合は空
+    console.log("✅ confirmShipment success:", orderId, respBody);
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("❌ Error in /confirm-shipment:", err);
+    return res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+
+    
     const ordersJson = await ordersRes.json();
     const rawOrders = ordersJson.Orders || [];
 

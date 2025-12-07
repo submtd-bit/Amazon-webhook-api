@@ -9,13 +9,6 @@ const LWA_CLIENT_SECRET = process.env.LWA_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.REFRESH_TOKEN;
 const MARKETPLACE_ID = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528";
 
-// Webhook受信エンドポイント
-app.post("/webhook", (req, res) => {
-  console.log("🔔 Webhook received:", req.body);
-
-  // ひとまず 200 OK を返す
-  res.status(200).json({ status: "ok" });
-});
 
 // LWA リフレッシュトークンから access_token を取得
 async function getLwaAccessToken() {

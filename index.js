@@ -4,13 +4,12 @@ const app = express();
 app.use(express.json());
 
 // ---- 共通設定 ----
-const LWA_CLIENT_ID = process.env.LWA_CLIENT_ID;
+const LWA_CLIENT_ID     = process.env.LWA_CLIENT_ID;
 const LWA_CLIENT_SECRET = process.env.LWA_CLIENT_SECRET;
-const REFRESH_TOKEN = process.env.REFRESH_TOKEN;
-const MARKETPLACE_ID = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528";
+const REFRESH_TOKEN     = process.env.REFRESH_TOKEN;
+const MARKETPLACE_ID    = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528"; // JP
 
-
-// LWA リフレッシュトークンから access_token を取得
+// ---- LWA リフレッシュトークンから access_token を取得 ----
 async function getLwaAccessToken() {
   const res = await fetch("https://api.amazon.com/auth/o2/token", {
     method: "POST",
@@ -19,8 +18,8 @@ async function getLwaAccessToken() {
       grant_type: "refresh_token",
       refresh_token: REFRESH_TOKEN,
       client_id: LWA_CLIENT_ID,
-      client_secret: LWA_CLIENT_SECRET
-    })
+      client_secret: LWA_CLIENT_SECRET,
+    }),
   });
 
   if (!res.ok) {
@@ -33,13 +32,13 @@ async function getLwaAccessToken() {
   return json.access_token;
 }
 
-// 既存 webhook エンドポイント（そのまま）
+// ---- Webhook（今はログ用） ----
 app.post("/webhook", (req, res) => {
   console.log("🔔 Webhook received:", req.body);
   res.status(200).json({ status: "ok" });
 });
 
-// ---- Orders API 本番実装 ----
+// ---- Orders API 本番実装 (/orders) ----
 app.get("/orders", async (req, res) => {
   try {
     // どこから取得するか：クエリで指定なければ過去24時間
@@ -53,15 +52,16 @@ app.get("/orders", async (req, res) => {
 
     // 2) Orders API を呼ぶ
     const ordersRes = await fetch(
-      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders?MarketplaceIds=${encodeURIComponent(
-        MARKETPLACE_ID
-      )}&CreatedAfter=${encodeURIComponent(createdAfter)}&OrderStatuses=Unshipped,PartiallyShipped`,
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders?` +
+        `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
+        `&CreatedAfter=${encodeURIComponent(createdAfter)}` +
+        `&OrderStatuses=Unshipped,PartiallyShipped`,
       {
         method: "GET",
         headers: {
           "x-amz-access-token": accessToken,
-          "accept": "application/json"
-        }
+          accept: "application/json",
+        },
       }
     );
 
@@ -73,7 +73,29 @@ app.get("/orders", async (req, res) => {
         .json({ error: "Orders API error", status: ordersRes.status, body: text });
     }
 
-// 既にある共通設定・getLwaAccessToken・/orders の下あたりに追加
+    const ordersJson = await ordersRes.json();
+    const rawOrders  = ordersJson.Orders || [];
+
+    // まずはヘッダ情報だけ返す（PIIなどは後でRDT対応）
+    const simplified = rawOrders.map((o) => ({
+      AmazonOrderId: o.AmazonOrderId,
+      PurchaseDate:  o.PurchaseDate,
+      OrderStatus:   o.OrderStatus,
+      OrderTotal:
+        o.OrderTotal && o.OrderTotal.Amount ? Number(o.OrderTotal.Amount) : null,
+      Currency:
+        o.OrderTotal && o.OrderTotal.CurrencyCode
+          ? o.OrderTotal.CurrencyCode
+          : null,
+      Items: [], // TODO: getOrderItems で後から拡張
+    }));
+
+    res.status(200).json(simplified);
+  } catch (err) {
+    console.error("❌ Error in /orders:", err);
+    res.status(500).json({ error: err.message || "SP-API error" });
+  }
+});
 
 // ---- 出荷通知API（佐川の伝票番号を使って confirmShipment） ----
 app.post("/confirm-shipment", async (req, res) => {
@@ -81,7 +103,9 @@ app.post("/confirm-shipment", async (req, res) => {
     const { orderId, trackingNumber } = req.body;
 
     if (!orderId || !trackingNumber) {
-      return res.status(400).json({ error: "orderId と trackingNumber は必須です" });
+      return res
+        .status(400)
+        .json({ error: "orderId と trackingNumber は必須です" });
     }
 
     // 1) LWAアクセストークン
@@ -106,14 +130,20 @@ app.post("/confirm-shipment", async (req, res) => {
       console.error("❌ getOrderItems error:", itemsRes.status, text);
       return res
         .status(itemsRes.status)
-        .json({ error: "getOrderItems error", status: itemsRes.status, body: text });
+        .json({
+          error: "getOrderItems error",
+          status: itemsRes.status,
+          body: text,
+        });
     }
 
-    const itemsJson = await itemsRes.json();
+    const itemsJson  = await itemsRes.json();
     const orderItems = itemsJson.OrderItems || [];
 
     if (orderItems.length === 0) {
-      return res.status(400).json({ error: "orderItems が取得できませんでした" });
+      return res
+        .status(400)
+        .json({ error: "orderItems が取得できませんでした" });
     }
 
     // 3) confirmShipment リクエストボディを構築
@@ -122,7 +152,7 @@ app.post("/confirm-shipment", async (req, res) => {
       packageReferenceId: "1",
       carrierCode: "SAGAWA",            // 佐川急便
       carrierName: "SAGAWA EXPRESS",    // 任意（表示用）
-      shippingMethod: "Hikyaku",        // 任意。空でも可
+      shippingMethod: "Hikyaku",        // 任意or空でも可
       trackingNumber,
       shipDate,
       orderItems: orderItems.map((oi) => ({
@@ -157,41 +187,20 @@ app.post("/confirm-shipment", async (req, res) => {
       console.error("❌ confirmShipment error:", confirmRes.status, text);
       return res
         .status(confirmRes.status)
-        .json({ error: "confirmShipment error", status: confirmRes.status, body: text });
+        .json({
+          error: "confirmShipment error",
+          status: confirmRes.status,
+          body: text,
+        });
     }
 
-    const respBody = await confirmRes.text(); // 204の場合は空
+    const respBody = await confirmRes.text(); // 204なら空文字
     console.log("✅ confirmShipment success:", orderId, respBody);
 
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("❌ Error in /confirm-shipment:", err);
     return res.status(500).json({ error: err.message || "Server error" });
-  }
-});
-
-
-    
-    const ordersJson = await ordersRes.json();
-    const rawOrders = ordersJson.Orders || [];
-
-    // ※ まずはシンプルにヘッダ情報だけ返す
-    // （PII住所などは RDT が必要になるので後で拡張）
-    const simplified = rawOrders.map((o) => ({
-      AmazonOrderId: o.AmazonOrderId,
-      PurchaseDate: o.PurchaseDate,
-      OrderStatus: o.OrderStatus,
-      OrderTotal:
-        o.OrderTotal && o.OrderTotal.Amount ? Number(o.OrderTotal.Amount) : null,
-      Currency:
-        o.OrderTotal && o.OrderTotal.CurrencyCode ? o.OrderTotal.CurrencyCode : null,
-      Items: [] // TODO: getOrderItems で後から拡張
-    }));
-
-    res.status(200).json(simplified);
-  } catch (err) {
-    console.error("❌ Error in /orders:", err);
-    res.status(500).json({ error: err.message || "SP-API error" });
   }
 });
 

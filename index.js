@@ -73,8 +73,9 @@ app.get("/orders", async (req, res) => {
         .json({ error: "Orders API error", status: ordersRes.status, body: text });
     }
 
-    const ordersJson = await ordersRes.json();
-    const rawOrders  = ordersJson.Orders || [];
+     const ordersJson = await ordersRes.json();
+     const rawOrders  = ordersJson?.payload?.Orders || [];
+
 
     // まずはヘッダ情報だけ返す（PIIなどは後でRDT対応）
     const simplified = rawOrders.map((o) => ({

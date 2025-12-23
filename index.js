@@ -32,188 +32,9 @@ async function getLwaAccessToken() {
   return json.access_token;
 }
 
-// ---- Webhook（今はログ用） ----
-app.post("/webhook", (req, res) => {
-  console.log("🔔 Webhook received:", req.body);
-  res.status(200).json({ status: "ok" });
-});
-
-// ---- Orders API 本番実装 (/orders) ----
-app.get("/orders", async (req, res) => {
-  try {
-    // どこから取得するか：クエリで指定なければ過去24時間
-    const since = req.query.createdAfter
-      ? new Date(req.query.createdAfter)
-      : new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const createdAfter = since.toISOString();
-
-    // 1) LWAアクセストークン取得
-    const accessToken = await getLwaAccessToken();
-
-    // 2) Orders API を呼ぶ
-    const ordersRes = await fetch(
-      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders?` +
-        `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
-        `&CreatedAfter=${encodeURIComponent(createdAfter)}` +
-        `&OrderStatuses=Unshipped,PartiallyShipped`,
-      {
-        method: "GET",
-        headers: {
-          "x-amz-access-token": accessToken,
-          accept: "application/json",
-        },
-      }
-    );
-
-    if (!ordersRes.ok) {
-      const text = await ordersRes.text();
-      console.error("❌ Orders API error:", ordersRes.status, text);
-      return res
-        .status(ordersRes.status)
-        .json({ error: "Orders API error", status: ordersRes.status, body: text });
-    }
-
-     const ordersJson = await ordersRes.json();
-     const rawOrders  = ordersJson?.payload?.Orders || [];
-
-
-    // まずはヘッダ情報だけ返す（PIIなどは後でRDT対応）
-    const simplified = rawOrders.map((o) => ({
-      AmazonOrderId: o.AmazonOrderId,
-      PurchaseDate:  o.PurchaseDate,
-      OrderStatus:   o.OrderStatus,
-      OrderTotal:
-        o.OrderTotal && o.OrderTotal.Amount ? Number(o.OrderTotal.Amount) : null,
-      Currency:
-        o.OrderTotal && o.OrderTotal.CurrencyCode
-          ? o.OrderTotal.CurrencyCode
-          : null,
-      Items: [], // TODO: getOrderItems で後から拡張
-    }));
-
-    res.status(200).json(simplified);
-  } catch (err) {
-    console.error("❌ Error in /orders:", err);
-    res.status(500).json({ error: err.message || "SP-API error" });
-  }
-});
-
-// ---- 出荷通知API（佐川の伝票番号を使って confirmShipment） ----
-app.post("/confirm-shipment", async (req, res) => {
-  try {
-    const { orderId, trackingNumber } = req.body;
-
-    if (!orderId || !trackingNumber) {
-      return res
-        .status(400)
-        .json({ error: "orderId と trackingNumber は必須です" });
-    }
-
-    // 1) LWAアクセストークン
-    const accessToken = await getLwaAccessToken();
-
-    // 2) 注文の明細（orderItemId と quantity）を取得
-    const itemsRes = await fetch(
-      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(
-        orderId
-      )}/orderItems`,
-      {
-        method: "GET",
-        headers: {
-          "x-amz-access-token": accessToken,
-          accept: "application/json",
-        },
-      }
-    );
-
-    if (!itemsRes.ok) {
-      const text = await itemsRes.text();
-      console.error("❌ getOrderItems error:", itemsRes.status, text);
-      return res
-        .status(itemsRes.status)
-        .json({
-          error: "getOrderItems error",
-          status: itemsRes.status,
-          body: text,
-        });
-    }
-
-    const itemsJson  = await itemsRes.json();
-    const orderItems = itemsJson.OrderItems || [];
-
-    if (orderItems.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "orderItems が取得できませんでした" });
-    }
-
-    // 3) confirmShipment リクエストボディを構築
-    const shipDate = new Date().toISOString();
-    const packageDetail = {
-      packageReferenceId: "1",
-      carrierCode: "SAGAWA",            // 佐川急便
-      carrierName: "SAGAWA EXPRESS",    // 任意（表示用）
-      shippingMethod: "Hikyaku",        // 任意or空でも可
-      trackingNumber,
-      shipDate,
-      orderItems: orderItems.map((oi) => ({
-        orderItemId: oi.OrderItemId,
-        quantity: oi.QuantityOrdered, // 全数量を一度に出荷する前提
-      })),
-    };
-
-    const body = {
-      marketplaceId: MARKETPLACE_ID,
-      packageDetail,
-    };
-
-    // 4) confirmShipment 呼び出し
-    const confirmRes = await fetch(
-      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(
-        orderId
-      )}/shipmentConfirmation`,
-      {
-        method: "POST",
-        headers: {
-          "x-amz-access-token": accessToken,
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        body: JSON.stringify(body),
-      }
-    );
-
-    if (!confirmRes.ok) {
-      const text = await confirmRes.text();
-      console.error("❌ confirmShipment error:", confirmRes.status, text);
-      return res
-        .status(confirmRes.status)
-        .json({
-          error: "confirmShipment error",
-          status: confirmRes.status,
-          body: text,
-        });
-    }
-
-    const respBody = await confirmRes.text(); // 204なら空文字
-    console.log("✅ confirmShipment success:", orderId, respBody);
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("❌ Error in /confirm-shipment:", err);
-    return res.status(500).json({ error: err.message || "Server error" });
-  }
-});
-
-// ---- Render が使うポート ----
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
-
-
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+// ---- health（Renderスリープ起こし用）----
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
 });
 
 // ---- 単一注文取得（切り分け用） ----
@@ -250,3 +71,153 @@ app.get("/order/:orderId", async (req, res) => {
   }
 });
 
+// ---- Webhook（今はログ用） ----
+app.post("/webhook", (req, res) => {
+  console.log("🔔 Webhook received:", req.body);
+  res.status(200).json({ status: "ok" });
+});
+
+// ---- Orders API (/orders) ----
+app.get("/orders", async (req, res) => {
+  try {
+    const since = req.query.createdAfter
+      ? new Date(req.query.createdAfter)
+      : new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const createdAfter = since.toISOString();
+
+    const accessToken = await getLwaAccessToken();
+
+    const ordersRes = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders?` +
+        `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
+        `&CreatedAfter=${encodeURIComponent(createdAfter)}` +
+        `&OrderStatuses=Unshipped,PartiallyShipped`,
+      {
+        method: "GET",
+        headers: {
+          "x-amz-access-token": accessToken,
+          accept: "application/json",
+        },
+      }
+    );
+
+    const text = await ordersRes.text();
+    if (!ordersRes.ok) {
+      console.error("❌ Orders API error:", ordersRes.status, text);
+      return res
+        .status(ordersRes.status)
+        .json({ error: "Orders API error", status: ordersRes.status, body: text });
+    }
+
+    const ordersJson = text ? JSON.parse(text) : {};
+    const rawOrders  = ordersJson?.payload?.Orders || [];
+
+    console.log("✅ /orders rawOrders count:", rawOrders.length);
+    // console.log("✅ /orders raw payload keys:", Object.keys(ordersJson || {})); //必要なら
+
+    const simplified = rawOrders.map((o) => ({
+      AmazonOrderId: o.AmazonOrderId,
+      PurchaseDate:  o.PurchaseDate,
+      OrderStatus:   o.OrderStatus,
+      OrderTotal: o.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
+      Currency:  o.OrderTotal?.CurrencyCode || null,
+      Items: [],
+    }));
+
+    return res.status(200).json(simplified);
+  } catch (err) {
+    console.error("❌ Error in /orders:", err);
+    return res.status(500).json({ error: err.message || "SP-API error" });
+  }
+});
+
+// ---- 出荷通知API (/confirm-shipment) ----
+app.post("/confirm-shipment", async (req, res) => {
+  try {
+    const { orderId: rawOrderId, trackingNumber } = req.body;
+
+    if (!rawOrderId || !trackingNumber) {
+      return res.status(400).json({ error: "orderId と trackingNumber は必須です" });
+    }
+
+    const orderId = String(rawOrderId).trim();
+    const accessToken = await getLwaAccessToken();
+
+    const itemsRes = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(orderId)}/orderItems`,
+      {
+        method: "GET",
+        headers: {
+          "x-amz-access-token": accessToken,
+          accept: "application/json",
+        },
+      }
+    );
+
+    const itemsText = await itemsRes.text();
+    if (!itemsRes.ok) {
+      console.error("❌ getOrderItems error:", itemsRes.status, itemsText);
+      return res.status(itemsRes.status).json({
+        error: "getOrderItems error",
+        status: itemsRes.status,
+        body: itemsText,
+      });
+    }
+
+    const itemsJson  = itemsText ? JSON.parse(itemsText) : {};
+    const orderItems = itemsJson?.payload?.OrderItems || itemsJson?.OrderItems || []; // ★payload対応
+
+    if (orderItems.length === 0) {
+      return res.status(400).json({ error: "orderItems が取得できませんでした" });
+    }
+
+    const shipDate = new Date().toISOString();
+    const packageDetail = {
+      packageReferenceId: "1",
+      carrierCode: "SAGAWA",
+      trackingNumber,
+      shipDate,
+      orderItems: orderItems.map((oi) => ({
+        orderItemId: oi.OrderItemId,
+        quantity: oi.QuantityOrdered,
+      })),
+    };
+
+    const body = { marketplaceId: MARKETPLACE_ID, packageDetail };
+
+    const confirmRes = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(orderId)}/shipmentConfirmation`,
+      {
+        method: "POST",
+        headers: {
+          "x-amz-access-token": accessToken,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const confirmText = await confirmRes.text();
+    if (!confirmRes.ok) {
+      console.error("❌ confirmShipment error:", confirmRes.status, confirmText);
+      return res.status(confirmRes.status).json({
+        error: "confirmShipment error",
+        status: confirmRes.status,
+        body: confirmText,
+      });
+    }
+
+    console.log("✅ confirmShipment success:", orderId, confirmText);
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("❌ Error in /confirm-shipment:", err);
+    return res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+// ---- Render が使うポート ----
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`🚀 Server running on port ${port}`);
+});

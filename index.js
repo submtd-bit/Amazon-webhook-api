@@ -214,3 +214,38 @@ app.listen(port, () => {
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
+
+// ---- 単一注文取得（切り分け用） ----
+app.get("/order/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const accessToken = await getLwaAccessToken();
+
+    const r = await fetch(
+      `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(orderId)}`,
+      {
+        method: "GET",
+        headers: {
+          "x-amz-access-token": accessToken,
+          accept: "application/json",
+        },
+      }
+    );
+
+    const text = await r.text();
+    if (!r.ok) {
+      console.error("❌ GetOrder error:", r.status, text);
+      return res.status(r.status).json({
+        error: "GetOrder error",
+        status: r.status,
+        body: text,
+      });
+    }
+
+    return res.status(200).json(JSON.parse(text));
+  } catch (e) {
+    console.error("❌ Error in /order/:orderId", e);
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+

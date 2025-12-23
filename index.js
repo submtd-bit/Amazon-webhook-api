@@ -32,6 +32,36 @@ async function getLwaAccessToken() {
   return json.access_token;
 }
 
+// ---- SP-API: orderItems を取得（/orders で Items を埋めるため） ----
+async function getOrderItems(accessToken, orderId) {
+  const r = await fetch(
+    `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders/${encodeURIComponent(orderId)}/orderItems`,
+    {
+      method: "GET",
+      headers: {
+        "x-amz-access-token": accessToken,
+        accept: "application/json",
+      },
+    }
+  );
+
+  const text = await r.text();
+  if (!r.ok) {
+    console.error("❌ getOrderItems error:", orderId, r.status, text);
+    return []; // 失敗しても一覧自体は返す
+  }
+
+  const json = text ? JSON.parse(text) : {};
+  const orderItems = json?.payload?.OrderItems || json?.OrderItems || [];
+
+  // GAS 側の importAmazonOrders() が期待するキーに合わせる
+  return orderItems.map((oi) => ({
+    SellerSKU: oi.SellerSKU || "",
+    Title: oi.Title || "",
+    QuantityOrdered: oi.QuantityOrdered ?? 1,
+  }));
+}
+
 // ---- health（Renderスリープ起こし用）----
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
@@ -87,19 +117,21 @@ app.get("/orders", async (req, res) => {
 
     const accessToken = await getLwaAccessToken();
 
-    const ordersRes = await fetch(
+    // ★ OrderStatuses は環境によってカンマ区切りが効かない場合があるので、
+    // 必要なら次の行を「&OrderStatuses=Unshipped&OrderStatuses=PartiallyShipped」に変更してください。
+    const ordersUrl =
       `https://sellingpartnerapi-fe.amazon.com/orders/v0/orders?` +
-        `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
-        `&CreatedAfter=${encodeURIComponent(createdAfter)}` +
-        `&OrderStatuses=Unshipped,PartiallyShipped`,
-      {
-        method: "GET",
-        headers: {
-          "x-amz-access-token": accessToken,
-          accept: "application/json",
-        },
-      }
-    );
+      `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
+      `&CreatedAfter=${encodeURIComponent(createdAfter)}` +
+      `&OrderStatuses=Unshipped,PartiallyShipped`;
+
+    const ordersRes = await fetch(ordersUrl, {
+      method: "GET",
+      headers: {
+        "x-amz-access-token": accessToken,
+        accept: "application/json",
+      },
+    });
 
     const text = await ordersRes.text();
     if (!ordersRes.ok) {
@@ -113,16 +145,35 @@ app.get("/orders", async (req, res) => {
     const rawOrders  = ordersJson?.payload?.Orders || [];
 
     console.log("✅ /orders rawOrders count:", rawOrders.length);
-    // console.log("✅ /orders raw payload keys:", Object.keys(ordersJson || {})); //必要なら
 
-    const simplified = rawOrders.map((o) => ({
-      AmazonOrderId: o.AmazonOrderId,
-      PurchaseDate:  o.PurchaseDate,
-      OrderStatus:   o.OrderStatus,
-      OrderTotal: o.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
-      Currency:  o.OrderTotal?.CurrencyCode || null,
-      Items: [],
-    }));
+    // ★ 各注文の明細を取って Items に埋める（順次実行・確実）
+    // 注文数が多い場合は、後で並列化や件数制限を入れて最適化できます。
+    const simplified = [];
+    for (const o of rawOrders) {
+      const items = await getOrderItems(accessToken, o.AmazonOrderId);
+
+      simplified.push({
+        AmazonOrderId: o.AmazonOrderId,
+        PurchaseDate:  o.PurchaseDate,
+        OrderStatus:   o.OrderStatus,
+
+        // 取れる範囲で入れる（無い注文もある）
+        BuyerName:  o?.BuyerInfo?.BuyerName || "",
+        BuyerEmail: o?.BuyerInfo?.BuyerEmail || "",
+
+        PostalCode:    o?.ShippingAddress?.PostalCode || "",
+        StateOrRegion: o?.ShippingAddress?.StateOrRegion || "",
+        City:          o?.ShippingAddress?.City || "",
+        AddressLine1:  o?.ShippingAddress?.AddressLine1 || "",
+        AddressLine2:  o?.ShippingAddress?.AddressLine2 || "",
+        Phone:         o?.ShippingAddress?.Phone || "",
+
+        OrderTotal: o?.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
+        Currency:   o?.OrderTotal?.CurrencyCode || null,
+
+        Items: items,
+      });
+    }
 
     return res.status(200).json(simplified);
   } catch (err) {

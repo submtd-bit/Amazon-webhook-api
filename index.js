@@ -9,6 +9,8 @@ const LWA_CLIENT_ID     = process.env.LWA_CLIENT_ID;
 const LWA_CLIENT_SECRET = process.env.LWA_CLIENT_SECRET;
 const REFRESH_TOKEN     = process.env.REFRESH_TOKEN;
 const MARKETPLACE_ID    = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528"; // JP
+const SPAPI_ENDPOINT = process.env.SPAPI_ENDPOINT || "https://sellingpartnerapi-fe.amazon.com";
+
 
 // 先頭付近に追加（発送元固定値：Render環境変数で管理）
 const SENDER_TEL   = process.env.SENDER_TEL;     // 例: 03-5831-5923

@@ -167,6 +167,7 @@ app.get("/orders", async (req, res) => {
         AddressLine1:  o?.ShippingAddress?.AddressLine1 || "",
         AddressLine2:  o?.ShippingAddress?.AddressLine2 || "",
         Phone:         o?.ShippingAddress?.Phone || "",
+        ShipName: o?.ShippingAddress?.Name || "",
 
         OrderTotal: o?.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
         Currency:   o?.OrderTotal?.CurrencyCode || null,

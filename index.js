@@ -240,6 +240,7 @@ async function fetchOrdersWithItems(createdAfterIso) {
 
   return enriched;
 }
+console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
 
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => {

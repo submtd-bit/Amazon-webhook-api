@@ -207,7 +207,7 @@ async function fetchOrdersWithItems(createdAfterIso) {
 
   const ordersJson = text ? JSON.parse(text) : {};
   const rawOrders  = ordersJson?.payload?.Orders || [];
-
+　console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
   const enriched = [];
   for (const o of rawOrders) {
     const items = await getOrderItems(accessToken, o.AmazonOrderId);
@@ -240,7 +240,7 @@ async function fetchOrdersWithItems(createdAfterIso) {
 
   return enriched;
 }
-console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
+
 
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => {
@@ -443,15 +443,17 @@ app.post("/confirm-shipment", async (req, res) => {
   }
 });
 
+app.get("/version", (req, res) => {
+  res.status(200).json({
+    version: "2026-01-04-1845", // ←ここを更新して目視確認
+  });
+});
+
 // ---- Render が使うポート ----
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
 
-app.get("/version", (req, res) => {
-  res.status(200).json({
-    version: "2026-01-04-1845", // ←ここを更新して目視確認
-  });
-});
+
 

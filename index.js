@@ -188,7 +188,8 @@ async function fetchOrdersWithItems(createdAfterIso) {
     `${SPAPI_ENDPOINT}/orders/v0/orders?` +
     `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
     `&CreatedAfter=${encodeURIComponent(createdAfterIso)}` +
-    `&OrderStatuses=Unshipped,PartiallyShipped`;
+    `&OrderStatuses=Unshipped&OrderStatuses=PartiallyShipped`;
+
 
   const ordersRes = await fetch(ordersUrl, {
     method: "GET",
@@ -446,3 +447,10 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
+
+app.get("/version", (req, res) => {
+  res.status(200).json({
+    version: "2026-01-04-1845", // ←ここを更新して目視確認
+  });
+});
+

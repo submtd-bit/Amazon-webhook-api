@@ -336,14 +336,16 @@ app.get("/sagawa.csv", async (req, res) => {
     lines.push(SAGAWA_HEADER.map(csvEscape).join(","));
 
     for (const order of orders) {
-      // ShippingAddress.Name が空だとラベルが作れないのでスキップ（ログだけ出す）
+      // Nameが空でも落とさない。BuyerNameにフォールバック
       if (!order?.ShippingAddress?.Name) {
-        console.warn("⚠️ Skip order (missing ShippingAddress.Name):", order?.AmazonOrderId);
-        continue;
+        order.ShippingAddress = order.ShippingAddress || {};
+        order.ShippingAddress.Name = order.BuyerName || "（氏名不明）";
       }
+    
       const row = orderToSagawaRow(order);
       lines.push(row.map(csvEscape).join(","));
     }
+
 
     const csv = lines.join("\n");
     res.setHeader("Content-Type", "text/csv; charset=utf-8");

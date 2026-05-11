@@ -25,14 +25,12 @@ const REQUIRED_SUBCONDITIONS = (process.env.REQUIRED_SUBCONDITIONS || "Very Good
   .filter(Boolean);
 
 // Summary.LowestPrices で優先する condition
-// Refurbished商品では、画面上の「整備済み品 - 非常に良い」がAPI上 condition:new として見えるケースがあるため。
 const REQUIRED_SUMMARY_CONDITIONS = (process.env.REQUIRED_SUMMARY_CONDITIONS || "new")
   .split(",")
   .map((s) => normalizeApiCondition(s))
   .filter(Boolean);
 
-// Summary.LowestPrices のうち required summary condition に合わない価格も価格調整に使うか。
-// 基本は false 推奨。
+// Summary.LowestPrices のうち required summary condition に合わない価格も価格調整に使うか
 const ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING =
   String(process.env.ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING || "false").toLowerCase() === "true";
 
@@ -50,7 +48,6 @@ const SENDER_NAME1  = process.env.SENDER_NAME1 || "";
 const SENDER_NAME2  = process.env.SENDER_NAME2 || "";
 
 // -------------------- Benchmark Master --------------------
-// G83は16GB/SSD256GBのみ。512GB・8GB・S73疑いは除外。
 const BENCHMARK_MASTER = [
   {
     active: true,
@@ -282,6 +279,15 @@ function buildSaleGuard({ sourceAvgPrice, apiPrice, effectivePrice, points }) {
   };
 }
 
+function amountOf(moneyObj) {
+  if (!moneyObj) return null;
+  const value = moneyObj.Amount ?? moneyObj.amount;
+  if (value === null || value === undefined || value === "") return null;
+
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 // -------------------- e飛伝Ⅲ header --------------------
 const SAGAWA_HEADER = [
   "お届け先コード取得区分","お届け先コード","お届け先電話番号","お届け先郵便番号",
@@ -305,7 +311,7 @@ const SAGAWA_HEADER = [
 
 function orderToSagawaRow(order) {
   const ship = order?.ShippingAddress || {};
-  const name = ship?.Name || "";
+  const name = ship?.Name || order?.BuyerName || "";
 
   const addr1 = joinNotEmpty(ship.StateOrRegion, ship.City);
   const addr2 = ship.AddressLine1 || "";
@@ -606,11 +612,7 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
 
   const offers = payload?.Offers || payload?.offers || [];
   const summary = payload?.Summary || payload?.summary || {};
-
-  const lowestPrices =
-    summary?.LowestPrices ||
-    summary?.lowestPrices ||
-    [];
+  const lowestPrices = summary?.LowestPrices || summary?.lowestPrices || [];
 
   const offerCount =
     num(summary?.TotalOfferCount) ??
@@ -861,6 +863,58 @@ async function fetchBenchmarkPrices() {
   });
 }
 
+// -------------------- SP-API: order address --------------------
+async function getOrderAddress(accessToken, orderId) {
+  const r = await fetch(
+    `${SPAPI_ENDPOINT}/orders/v0/orders/${encodeURIComponent(orderId)}/address`,
+    {
+      method: "GET",
+      headers: {
+        "x-amz-access-token": accessToken,
+        accept: "application/json"
+      }
+    }
+  );
+
+  const text = await r.text();
+
+  if (!r.ok) {
+    console.error("❌ getOrderAddress error:", orderId, r.status, text);
+    return {};
+  }
+
+  const json = text ? JSON.parse(text) : {};
+  const payload = json?.payload || json?.Payload || {};
+
+  return payload?.ShippingAddress || payload?.shippingAddress || payload || {};
+}
+
+// -------------------- SP-API: buyer info --------------------
+async function getOrderBuyerInfo(accessToken, orderId) {
+  const r = await fetch(
+    `${SPAPI_ENDPOINT}/orders/v0/orders/${encodeURIComponent(orderId)}/buyerInfo`,
+    {
+      method: "GET",
+      headers: {
+        "x-amz-access-token": accessToken,
+        accept: "application/json"
+      }
+    }
+  );
+
+  const text = await r.text();
+
+  if (!r.ok) {
+    console.error("❌ getOrderBuyerInfo error:", orderId, r.status, text);
+    return {};
+  }
+
+  const json = text ? JSON.parse(text) : {};
+  const payload = json?.payload || json?.Payload || {};
+
+  return payload?.BuyerInfo || payload?.buyerInfo || payload || {};
+}
+
 // -------------------- SP-API: orderItems --------------------
 async function getOrderItems(accessToken, orderId) {
   const r = await fetch(
@@ -875,6 +929,7 @@ async function getOrderItems(accessToken, orderId) {
   );
 
   const text = await r.text();
+
   if (!r.ok) {
     console.error("❌ getOrderItems error:", orderId, r.status, text);
     return [];
@@ -887,11 +942,22 @@ async function getOrderItems(accessToken, orderId) {
     SellerSKU: oi.SellerSKU || "",
     Title: oi.Title || "",
     QuantityOrdered: oi.QuantityOrdered ?? 1,
-    OrderItemId: oi.OrderItemId || ""
+    OrderItemId: oi.OrderItemId || "",
+
+    ShippingFee: amountOf(oi.ShippingPrice),
+    ShippingTax: amountOf(oi.ShippingTax),
+    TotalTax: amountOf(oi.ItemTax),
+    PromotionDiscount: amountOf(oi.PromotionDiscount),
+
+    ItemPrice: amountOf(oi.ItemPrice),
+    ItemTax: amountOf(oi.ItemTax),
+    ShippingDiscount: amountOf(oi.ShippingDiscount),
+    ShippingDiscountTax: amountOf(oi.ShippingDiscountTax),
+    PromotionDiscountTax: amountOf(oi.PromotionDiscountTax)
   }));
 }
 
-// -------------------- 共通：注文+明細を取得 --------------------
+// -------------------- 共通：注文+住所+購入者+明細を取得 --------------------
 async function fetchOrdersWithItems(createdAfterIso) {
   const accessToken = await getLwaAccessToken();
 
@@ -910,6 +976,7 @@ async function fetchOrdersWithItems(createdAfterIso) {
   });
 
   const text = await ordersRes.text();
+
   if (!ordersRes.ok) {
     console.error("❌ Orders API error:", ordersRes.status, text);
     throw new Error(`Orders API error: ${ordersRes.status} ${text}`);
@@ -921,30 +988,113 @@ async function fetchOrdersWithItems(createdAfterIso) {
   console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
 
   const enriched = [];
+
   for (const o of rawOrders) {
-    const items = await getOrderItems(accessToken, o.AmazonOrderId);
+    const orderId = o.AmazonOrderId;
+
+    const items = await getOrderItems(accessToken, orderId);
+    const shippingAddress = await getOrderAddress(accessToken, orderId);
+    const buyerInfo = await getOrderBuyerInfo(accessToken, orderId);
+
+    const fallbackShip = o?.ShippingAddress || {};
+
+    const shipName =
+      shippingAddress?.Name ||
+      shippingAddress?.name ||
+      fallbackShip?.Name ||
+      "";
+
+    const postalCode =
+      shippingAddress?.PostalCode ||
+      shippingAddress?.postalCode ||
+      fallbackShip?.PostalCode ||
+      "";
+
+    const stateOrRegion =
+      shippingAddress?.StateOrRegion ||
+      shippingAddress?.stateOrRegion ||
+      fallbackShip?.StateOrRegion ||
+      "";
+
+    const city =
+      shippingAddress?.City ||
+      shippingAddress?.city ||
+      fallbackShip?.City ||
+      "";
+
+    const addressLine1 =
+      shippingAddress?.AddressLine1 ||
+      shippingAddress?.addressLine1 ||
+      fallbackShip?.AddressLine1 ||
+      "";
+
+    const addressLine2 =
+      shippingAddress?.AddressLine2 ||
+      shippingAddress?.addressLine2 ||
+      fallbackShip?.AddressLine2 ||
+      "";
+
+    const addressLine3 =
+      shippingAddress?.AddressLine3 ||
+      shippingAddress?.addressLine3 ||
+      fallbackShip?.AddressLine3 ||
+      "";
+
+    const phone =
+      shippingAddress?.Phone ||
+      shippingAddress?.phone ||
+      fallbackShip?.Phone ||
+      "";
+
+    const buyerName =
+      buyerInfo?.BuyerName ||
+      buyerInfo?.buyerName ||
+      o?.BuyerInfo?.BuyerName ||
+      "";
+
+    const buyerEmail =
+      buyerInfo?.BuyerEmail ||
+      buyerInfo?.buyerEmail ||
+      o?.BuyerInfo?.BuyerEmail ||
+      "";
+
+    const shippingFee = items.reduce((sum, item) => sum + (Number(item.ShippingFee) || 0), 0);
+    const shippingTax = items.reduce((sum, item) => sum + (Number(item.ShippingTax) || 0), 0);
+    const totalTax = items.reduce((sum, item) => sum + (Number(item.TotalTax) || 0), 0);
+    const promotionDiscount = items.reduce((sum, item) => sum + (Number(item.PromotionDiscount) || 0), 0);
 
     enriched.push({
-      AmazonOrderId: o.AmazonOrderId,
+      AmazonOrderId: orderId,
       PurchaseDate:  o.PurchaseDate,
       OrderStatus:   o.OrderStatus,
 
-      BuyerName:  o?.BuyerInfo?.BuyerName || "",
-      BuyerEmail: o?.BuyerInfo?.BuyerEmail || "",
+      BuyerName: buyerName,
+      BuyerEmail: buyerEmail,
 
       ShippingAddress: {
-        Name:          o?.ShippingAddress?.Name || "",
-        Phone:         o?.ShippingAddress?.Phone || "",
-        PostalCode:    o?.ShippingAddress?.PostalCode || "",
-        StateOrRegion: o?.ShippingAddress?.StateOrRegion || "",
-        City:          o?.ShippingAddress?.City || "",
-        AddressLine1:  o?.ShippingAddress?.AddressLine1 || "",
-        AddressLine2:  o?.ShippingAddress?.AddressLine2 || "",
-        AddressLine3:  o?.ShippingAddress?.AddressLine3 || ""
+        Name:          shipName,
+        Phone:         phone,
+        PostalCode:    postalCode,
+        StateOrRegion: stateOrRegion,
+        City:          city,
+        AddressLine1:  addressLine1,
+        AddressLine2:  addressLine2,
+        AddressLine3:  addressLine3
       },
 
       OrderTotal: o?.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
       Currency:   o?.OrderTotal?.CurrencyCode || null,
+
+      ShippingFee: shippingFee || null,
+      ShippingTax: shippingTax || null,
+      TotalTax: totalTax || null,
+      PromotionDiscount: promotionDiscount || null,
+
+      FulfillmentChannel: o?.FulfillmentChannel || "",
+      PaymentMethod: o?.PaymentMethod || "",
+      ShipmentServiceLevelCategory: o?.ShipmentServiceLevelCategory || "",
+      LatestShipDate: o?.LatestShipDate || "",
+      ShipServiceLevel: o?.ShipServiceLevel || "",
 
       Items: items
     });
@@ -1062,6 +1212,7 @@ app.get("/pricing-raw/:asin", async (req, res) => {
   }
 });
 
+// 切り分け用：単一注文の基本情報
 app.get("/order/:orderId", async (req, res) => {
   try {
     const orderId = req.params.orderId;
@@ -1079,6 +1230,7 @@ app.get("/order/:orderId", async (req, res) => {
     );
 
     const text = await r.text();
+
     if (!r.ok) {
       console.error("❌ GetOrder error:", r.status, text);
       return res.status(r.status).json({
@@ -1095,6 +1247,29 @@ app.get("/order/:orderId", async (req, res) => {
   }
 });
 
+// 切り分け用：単一注文の住所・購入者・明細を確認
+app.get("/order-full/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const accessToken = await getLwaAccessToken();
+
+    const address = await getOrderAddress(accessToken, orderId);
+    const buyerInfo = await getOrderBuyerInfo(accessToken, orderId);
+    const items = await getOrderItems(accessToken, orderId);
+
+    return res.status(200).json({
+      AmazonOrderId: orderId,
+      address,
+      buyerInfo,
+      items
+    });
+  } catch (e) {
+    console.error("❌ Error in /order-full/:orderId", e);
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// 注文一覧JSON
 app.get("/orders", async (req, res) => {
   try {
     const since = req.query.createdAfter
@@ -1116,12 +1291,25 @@ app.get("/orders", async (req, res) => {
       City:          o.ShippingAddress.City,
       AddressLine1:  o.ShippingAddress.AddressLine1,
       AddressLine2:  o.ShippingAddress.AddressLine2,
+      AddressLine3:  o.ShippingAddress.AddressLine3,
       Phone:         o.ShippingAddress.Phone,
       ShipName:      o.ShippingAddress.Name,
 
       OrderTotal: o.OrderTotal,
       Currency:   o.Currency,
-      Items:      o.Items
+
+      ShippingFee: o.ShippingFee,
+      ShippingTax: o.ShippingTax,
+      TotalTax: o.TotalTax,
+      PromotionDiscount: o.PromotionDiscount,
+
+      FulfillmentChannel: o.FulfillmentChannel,
+      PaymentMethod: o.PaymentMethod,
+      ShipmentServiceLevelCategory: o.ShipmentServiceLevelCategory,
+      LatestShipDate: o.LatestShipDate,
+      ShipServiceLevel: o.ShipServiceLevel,
+
+      Items: o.Items
     }));
 
     return res.status(200).json(simplified);
@@ -1131,6 +1319,7 @@ app.get("/orders", async (req, res) => {
   }
 });
 
+// e飛伝Ⅲ取込用CSV
 app.get("/sagawa.csv", async (req, res) => {
   try {
     const since = req.query.createdAfter
@@ -1162,6 +1351,7 @@ app.get("/sagawa.csv", async (req, res) => {
   }
 });
 
+// 出荷通知
 app.post("/confirm-shipment", async (req, res) => {
   try {
     const { orderId: rawOrderId, trackingNumber } = req.body;
@@ -1185,6 +1375,7 @@ app.post("/confirm-shipment", async (req, res) => {
     );
 
     const itemsText = await itemsRes.text();
+
     if (!itemsRes.ok) {
       console.error("❌ getOrderItems error:", itemsRes.status, itemsText);
       return res.status(itemsRes.status).json({
@@ -1202,6 +1393,7 @@ app.post("/confirm-shipment", async (req, res) => {
     }
 
     const shipDate = new Date().toISOString();
+
     const packageDetail = {
       packageReferenceId: "1",
       carrierCode: "SAGAWA",
@@ -1213,7 +1405,10 @@ app.post("/confirm-shipment", async (req, res) => {
       }))
     };
 
-    const body = { marketplaceId: MARKETPLACE_ID, packageDetail };
+    const body = {
+      marketplaceId: MARKETPLACE_ID,
+      packageDetail
+    };
 
     const confirmRes = await fetch(
       `${SPAPI_ENDPOINT}/orders/v0/orders/${encodeURIComponent(orderId)}/shipmentConfirmation`,
@@ -1229,6 +1424,7 @@ app.post("/confirm-shipment", async (req, res) => {
     );
 
     const confirmText = await confirmRes.text();
+
     if (!confirmRes.ok) {
       console.error("❌ confirmShipment error:", confirmRes.status, confirmText);
       return res.status(confirmRes.status).json({
@@ -1248,7 +1444,7 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-benchmark-prices-lwa-v5-summary-new-priority",
+    version: "2026-05-11-orders-address-v6",
     marketplaceId: MARKETPLACE_ID,
     endpoint: SPAPI_ENDPOINT,
     pricingConditions: PRICING_ITEM_CONDITIONS,
@@ -1256,12 +1452,15 @@ app.get("/version", (req, res) => {
     requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
     allowSummaryLowestPriceForRepricing: ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING,
     saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
-    saleGuardPointRate: SALE_GUARD_POINT_RATE
+    saleGuardPointRate: SALE_GUARD_POINT_RATE,
+    ordersAddressEnabled: true,
+    orderFullEndpoint: "/order-full/:orderId"
   });
 });
 
 // ---- Render が使うポート ----
 const port = process.env.PORT || 3000;
+
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });

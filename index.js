@@ -382,7 +382,55 @@ function normalizeOffer(offer) {
     fulfillment: offer?.IsFulfilledByAmazon ? "AFN" : "MFN",
     isBuyBoxWinner: Boolean(offer?.IsBuyBoxWinner),
     isFeaturedMerchant: Boolean(offer?.IsFeaturedMerchant),
-    subCondition: offer?.SubCondition || ""
+    subCondition: offer?.SubCondition || "",
+    priceSource: "Offers"
+  };
+}
+
+function normalizeLowestPrice(lp) {
+  const listingPrice = extractAmount(lp?.ListingPrice ?? lp?.listingPrice);
+  const landedPriceFromApi = extractAmount(lp?.LandedPrice ?? lp?.landedPrice);
+  const shippingPrice = extractAmount(lp?.Shipping ?? lp?.shipping) ?? 0;
+
+  // Summary.LowestPrices では LandedPrice が直接入ることが多い。
+  // LandedPriceがあればそれを優先し、なければ ListingPrice + Shipping で計算。
+  const landedPrice =
+    landedPriceFromApi !== null
+      ? landedPriceFromApi
+      : listingPrice !== null
+        ? listingPrice + shippingPrice
+        : null;
+
+  const points = null;
+  const coupon = null;
+
+  const effectivePrice = landedPrice !== null
+    ? landedPrice - (points || 0) - (coupon || 0)
+    : null;
+
+  const fulfillmentRaw =
+    lp?.fulfillmentChannel ||
+    lp?.FulfillmentChannel ||
+    "";
+
+  let fulfillment = "";
+  if (fulfillmentRaw === "Amazon") fulfillment = "AFN";
+  else if (fulfillmentRaw === "Merchant") fulfillment = "MFN";
+  else fulfillment = fulfillmentRaw || "";
+
+  return {
+    listingPrice,
+    shippingPrice,
+    landedPrice,
+    points,
+    coupon,
+    effectivePrice,
+    seller: "",
+    fulfillment,
+    isBuyBoxWinner: false,
+    isFeaturedMerchant: false,
+    subCondition: lp?.condition || lp?.Condition || "",
+    priceSource: "Summary.LowestPrices"
   };
 }
 
@@ -395,7 +443,6 @@ function pickBestOffer(offers) {
 
   if (normalized.length === 0) return null;
 
-  // 価格監視・自動価格調整のため、BuyBox優先ではなく「実質最安」を採用。
   normalized.sort((a, b) => {
     if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
     if (a.isBuyBoxWinner && !b.isBuyBoxWinner) return -1;
@@ -406,12 +453,31 @@ function pickBestOffer(offers) {
   return normalized[0];
 }
 
+function pickBestLowestPrice(lowestPrices) {
+  if (!Array.isArray(lowestPrices) || lowestPrices.length === 0) return null;
+
+  const normalized = lowestPrices
+    .map(normalizeLowestPrice)
+    .filter((o) => o.landedPrice !== null);
+
+  if (normalized.length === 0) return null;
+
+  normalized.sort((a, b) => {
+    if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
+    return a.landedPrice - b.landedPrice;
+  });
+
+  return normalized[0];
+}
+
 function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
   const statusCode =
-    batchItem?.status?.statusCode ??
-    batchItem?.Status?.StatusCode ??
-    batchItem?.statusCode ??
-    null;
+    typeof batchItem?.status === "number"
+      ? batchItem.status
+      : batchItem?.status?.statusCode ??
+        batchItem?.Status?.StatusCode ??
+        batchItem?.statusCode ??
+        null;
 
   const body = batchItem?.body || batchItem?.Body || {};
   const payload = body?.payload || body?.Payload || body || {};
@@ -419,14 +485,24 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
   const offers = payload?.Offers || payload?.offers || [];
   const summary = payload?.Summary || payload?.summary || {};
 
+  const lowestPrices =
+    summary?.LowestPrices ||
+    summary?.lowestPrices ||
+    [];
+
   const offerCount =
     num(summary?.TotalOfferCount) ??
+    num(summary?.totalOfferCount) ??
     num(payload?.TotalOfferCount) ??
     (Array.isArray(offers) ? offers.length : 0);
 
+  // まず Offers 配列を見る。
+  // Offers に価格がなければ Summary.LowestPrices を見る。
   const bestOffer = pickBestOffer(offers);
+  const bestSummaryPrice = pickBestLowestPrice(lowestPrices);
+  const bestPrice = bestOffer || bestSummaryPrice;
 
-  if (!bestOffer) {
+  if (!bestPrice) {
     return {
       checkedAt: new Date().toISOString(),
       group: masterItem.group,
@@ -442,19 +518,19 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
       effectivePrice: null,
       seller: "",
       fulfillment: "",
-      availability: offerCount > 0 ? "offer_summary_only" : "no_offer",
+      availability: offerCount > 0 ? "offer_summary_only_no_price" : "no_offer",
       offerCount,
       source: `SP-API getItemOffersBatch / ${itemCondition}`,
       confidence: statusCode === 200 ? "low" : "api_error",
       avgPriceDiff: null,
       itemCondition,
       memo: statusCode === 200
-        ? "Offers配列に価格がありませんでした"
+        ? `Offers価格なし / LowestPrices価格なし / offerCount=${offerCount}`
         : `API statusCode=${statusCode}`
     };
   }
 
-  const effective = bestOffer.effectivePrice;
+  const effective = bestPrice.effectivePrice;
   const avg = num(masterItem.sourceAvgPrice);
   const avgPriceDiff = effective !== null && avg !== null ? effective - avg : null;
 
@@ -465,21 +541,24 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
     asin: masterItem.asin,
     productName: masterItem.productName,
     sourceAvgPrice: masterItem.sourceAvgPrice,
-    apiPrice: bestOffer.listingPrice,
-    shippingPrice: bestOffer.shippingPrice,
-    landedPrice: bestOffer.landedPrice,
-    points: bestOffer.points,
-    coupon: bestOffer.coupon,
-    effectivePrice: bestOffer.effectivePrice,
-    seller: bestOffer.seller,
-    fulfillment: bestOffer.fulfillment,
+    apiPrice: bestPrice.listingPrice,
+    shippingPrice: bestPrice.shippingPrice,
+    landedPrice: bestPrice.landedPrice,
+    points: bestPrice.points,
+    coupon: bestPrice.coupon,
+    effectivePrice: bestPrice.effectivePrice,
+    seller: bestPrice.seller,
+    fulfillment: bestPrice.fulfillment,
     availability: "offer_found",
     offerCount,
     source: `SP-API getItemOffersBatch / ${itemCondition}`,
-    confidence: "high",
+    confidence: bestPrice.priceSource === "Offers" ? "high" : "medium",
     avgPriceDiff,
     itemCondition,
-    memo: bestOffer.isBuyBoxWinner ? "BuyBoxWinner offer" : "lowest effective offer"
+    memo:
+      bestPrice.priceSource === "Offers"
+        ? (bestPrice.isBuyBoxWinner ? "Offers / BuyBoxWinner offer" : "Offers / lowest effective offer")
+        : "Summary.LowestPrices / lowest landed price"
   };
 }
 
@@ -920,7 +999,7 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-benchmark-prices-lwa-v1",
+    version: "2026-05-11-benchmark-prices-lwa-v2-lowestprices",
     marketplaceId: MARKETPLACE_ID,
     endpoint: SPAPI_ENDPOINT,
     pricingConditions: PRICING_ITEM_CONDITIONS

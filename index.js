@@ -26,8 +26,8 @@ const REQUESTER_TEL = process.env.REQUESTER_TEL || "";
 
 const SENDER_POST   = process.env.SENDER_POST || "";
 const SENDER_ADDR1  = process.env.SENDER_ADDR1 || "";
-const SENDER_NAME1  = process.env.SENDER_NAME1 || ""; // 例: Amazon.co.jp
-const SENDER_NAME2  = process.env.SENDER_NAME2 || ""; // 例: MTDオンラインストア
+const SENDER_NAME1  = process.env.SENDER_NAME1 || "";
+const SENDER_NAME2  = process.env.SENDER_NAME2 || "";
 
 // -------------------- Benchmark Master --------------------
 // G83は16GB/SSD256GBのみ。512GB・8GB・S73疑いは除外。
@@ -293,7 +293,6 @@ async function getLwaAccessToken() {
 }
 
 // -------------------- 共通：SP-API request --------------------
-// 2023年10月以降のSP-APIはSigV4署名不要。LWA access tokenで呼ぶ。
 async function spApiRequest({ method = "GET", path, body = null, accessToken }) {
   const bodyText = body ? JSON.stringify(body) : undefined;
 
@@ -355,16 +354,28 @@ function extractPointsValue(offer) {
   return null;
 }
 
+function extractPointsNumber(pointsObj) {
+  if (!pointsObj) return null;
+
+  const pointsNumber =
+    num(pointsObj.PointsNumber) ??
+    num(pointsObj.pointsNumber);
+
+  if (pointsNumber !== null) return pointsNumber;
+
+  const monetaryValue = extractAmount(
+    pointsObj.PointsMonetaryValue ?? pointsObj.pointsMonetaryValue
+  );
+
+  return monetaryValue;
+}
+
 function normalizeOffer(offer) {
   const listingPrice = extractAmount(offer?.ListingPrice ?? offer?.listingPrice);
   const shippingPrice = extractAmount(offer?.Shipping ?? offer?.shipping) ?? 0;
   const landedPrice = listingPrice !== null ? listingPrice + shippingPrice : null;
 
-  // Amazonポイントは日本では基本的に1pt=1円扱いで実質価格から控除。
-  // 取れない場合はnull。
   const points = extractPointsValue(offer);
-
-  // クーポンはSP-API Product Pricingから安定取得できない想定。
   const coupon = null;
 
   const effectivePrice = landedPrice !== null
@@ -392,20 +403,20 @@ function normalizeLowestPrice(lp) {
   const landedPriceFromApi = extractAmount(lp?.LandedPrice ?? lp?.landedPrice);
   const shippingPrice = extractAmount(lp?.Shipping ?? lp?.shipping) ?? 0;
 
-  // Summary.LowestPrices では LandedPrice が直接入ることが多い。
-  // LandedPriceがあればそれを優先し、なければ ListingPrice + Shipping で計算。
+  const points = extractPointsNumber(lp?.Points ?? lp?.points);
+  const coupon = null;
+
+  // Summary.LowestPrices の LandedPrice は、JPでは ListingPrice + Shipping - Points の形で返ることがあります。
+  // そのため LandedPrice が返ってきている場合はAPI値を優先します。
   const landedPrice =
     landedPriceFromApi !== null
       ? landedPriceFromApi
       : listingPrice !== null
-        ? listingPrice + shippingPrice
+        ? listingPrice + shippingPrice - (points || 0)
         : null;
 
-  const points = null;
-  const coupon = null;
-
   const effectivePrice = landedPrice !== null
-    ? landedPrice - (points || 0) - (coupon || 0)
+    ? landedPrice - (coupon || 0)
     : null;
 
   const fulfillmentRaw =
@@ -496,8 +507,6 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
     num(payload?.TotalOfferCount) ??
     (Array.isArray(offers) ? offers.length : 0);
 
-  // まず Offers 配列を見る。
-  // Offers に価格がなければ Summary.LowestPrices を見る。
   const bestOffer = pickBestOffer(offers);
   const bestSummaryPrice = pickBestLowestPrice(lowestPrices);
   const bestPrice = bestOffer || bestSummaryPrice;
@@ -580,7 +589,6 @@ async function fetchBenchmarkPrices() {
     const remainingItems = activeItems.filter((item) => !finalResultsByAsin.has(item.asin));
     if (remainingItems.length === 0) break;
 
-    // getItemOffersBatchはレート制限が低いので、複数conditionを試す場合は待つ。
     if (idx > 0) {
       await sleep(11000);
     }
@@ -600,8 +608,6 @@ async function fetchBenchmarkPrices() {
       const batchItem = responses[i] || {};
       const parsed = parseBatchResponseForItem(masterItem, batchItem, itemCondition);
 
-      // offer_foundなら確定。
-      // offerがない場合でも、最後のconditionなら結果として残す。
       if (parsed.availability === "offer_found" || idx === PRICING_ITEM_CONDITIONS.length - 1) {
         finalResultsByAsin.set(masterItem.asin, parsed);
       }
@@ -737,12 +743,10 @@ app.post("/webhook", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-// 価格監視：Benchmark Master確認用
 app.get("/benchmark-master", (req, res) => {
   res.status(200).json(BENCHMARK_MASTER);
 });
 
-// 価格監視：Amazon Product Pricing API
 app.get("/benchmark-prices", async (req, res) => {
   try {
     const prices = await fetchBenchmarkPrices();
@@ -756,8 +760,6 @@ app.get("/benchmark-prices", async (req, res) => {
   }
 });
 
-// 価格監視：単一ASINテスト用
-// 例: /pricing-test/B0DR9BRG8B
 app.get("/pricing-test/:asin", async (req, res) => {
   try {
     const asin = String(req.params.asin || "").trim();
@@ -809,7 +811,6 @@ app.get("/pricing-test/:asin", async (req, res) => {
   }
 });
 
-// 切り分け用：単一注文
 app.get("/order/:orderId", async (req, res) => {
   try {
     const orderId = req.params.orderId;
@@ -843,7 +844,6 @@ app.get("/order/:orderId", async (req, res) => {
   }
 });
 
-// 注文一覧JSON（既存）
 app.get("/orders", async (req, res) => {
   try {
     const since = req.query.createdAfter
@@ -880,7 +880,6 @@ app.get("/orders", async (req, res) => {
   }
 });
 
-// e飛伝Ⅲ取込用CSV
 app.get("/sagawa.csv", async (req, res) => {
   try {
     const since = req.query.createdAfter
@@ -912,7 +911,6 @@ app.get("/sagawa.csv", async (req, res) => {
   }
 });
 
-// 出荷通知（既存）
 app.post("/confirm-shipment", async (req, res) => {
   try {
     const { orderId: rawOrderId, trackingNumber } = req.body;
@@ -999,7 +997,7 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-benchmark-prices-lwa-v2-lowestprices",
+    version: "2026-05-11-benchmark-prices-lwa-v3-points-lowestprices",
     marketplaceId: MARKETPLACE_ID,
     endpoint: SPAPI_ENDPOINT,
     pricingConditions: PRICING_ITEM_CONDITIONS

@@ -20,6 +20,22 @@ const PRICING_ITEM_CONDITIONS = (process.env.PRICING_ITEM_CONDITIONS || "Refurbi
   .map((s) => s.trim())
   .filter(Boolean);
 
+// 自動価格調整に使うサブコンディション。
+// Amazon APIでは英語で返る想定：Very Good / Good / Acceptable など。
+const REQUIRED_SUBCONDITIONS = (process.env.REQUIRED_SUBCONDITIONS || "Very Good")
+  .split(",")
+  .map((s) => normalizeSubCondition(s))
+  .filter(Boolean);
+
+// Summary.LowestPrices は状態別価格が不明になりやすいため、初期値は false 推奨。
+const ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING =
+  String(process.env.ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING || "false").toLowerCase() === "true";
+
+// セール・異常値ガード。
+// 資料平均比 -15%以下、またはポイント率3%以上なら自動価格調整から除外。
+const SALE_GUARD_AVG_DROP_RATE = Number(process.env.SALE_GUARD_AVG_DROP_RATE || "-0.15");
+const SALE_GUARD_POINT_RATE    = Number(process.env.SALE_GUARD_POINT_RATE || "0.03");
+
 // ---- 発送元固定（Render Environment Variables）----
 const SHIPPER_TEL   = process.env.SHIPPER_TEL || "";
 const REQUESTER_TEL = process.env.REQUESTER_TEL || "";
@@ -186,6 +202,77 @@ function safeJsonParse(text) {
   } catch (e) {
     return { rawText: text };
   }
+}
+
+function normalizeSubCondition(value) {
+  const s = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+
+  if (!s) return "";
+
+  if (s === "very good" || s === "verygood" || s === "非常に良い" || s === "非常に良い品") {
+    return "very good";
+  }
+
+  if (s === "good" || s === "良い" || s === "良い品") {
+    return "good";
+  }
+
+  if (s === "acceptable" || s === "可" || s === "可品") {
+    return "acceptable";
+  }
+
+  if (s === "like new" || s === "likenew" || s === "ほぼ新品") {
+    return "like new";
+  }
+
+  return s;
+}
+
+function isRequiredSubConditionMatched(subCondition) {
+  if (REQUIRED_SUBCONDITIONS.length === 0) return true;
+  const normalized = normalizeSubCondition(subCondition);
+  if (!normalized) return false;
+  return REQUIRED_SUBCONDITIONS.includes(normalized);
+}
+
+function calcRate(numerator, denominator) {
+  const a = num(numerator);
+  const b = num(denominator);
+  if (a === null || b === null || b === 0) return null;
+  return a / b;
+}
+
+function buildSaleGuard({ sourceAvgPrice, apiPrice, effectivePrice, points }) {
+  const avg = num(sourceAvgPrice);
+  const effective = num(effectivePrice);
+  const price = num(apiPrice);
+  const pointValue = num(points);
+
+  const avgPriceDiff = effective !== null && avg !== null ? effective - avg : null;
+  const avgPriceDiffRate = avgPriceDiff !== null && avg ? avgPriceDiff / avg : null;
+  const pointRate = pointValue !== null && price ? pointValue / price : null;
+
+  const reasons = [];
+
+  if (avgPriceDiffRate !== null && avgPriceDiffRate <= SALE_GUARD_AVG_DROP_RATE) {
+    reasons.push(`資料平均との差率${Math.round(avgPriceDiffRate * 1000) / 10}%`);
+  }
+
+  if (pointRate !== null && pointRate >= SALE_GUARD_POINT_RATE) {
+    reasons.push(`ポイント率${Math.round(pointRate * 1000) / 10}%`);
+  }
+
+  return {
+    avgPriceDiff,
+    avgPriceDiffRate,
+    pointRate,
+    isSaleGuard: reasons.length > 0,
+    saleGuardReason: reasons.join(" / ")
+  };
 }
 
 // -------------------- e飛伝Ⅲ header --------------------
@@ -382,6 +469,15 @@ function normalizeOffer(offer) {
     ? landedPrice - (points || 0) - (coupon || 0)
     : null;
 
+  const rawSubCondition =
+    offer?.SubCondition ??
+    offer?.subCondition ??
+    offer?.Subcondition ??
+    "";
+
+  const subCondition = normalizeSubCondition(rawSubCondition);
+  const isSubConditionMatched = isRequiredSubConditionMatched(subCondition);
+
   return {
     listingPrice,
     shippingPrice,
@@ -393,7 +489,9 @@ function normalizeOffer(offer) {
     fulfillment: offer?.IsFulfilledByAmazon ? "AFN" : "MFN",
     isBuyBoxWinner: Boolean(offer?.IsBuyBoxWinner),
     isFeaturedMerchant: Boolean(offer?.IsFeaturedMerchant),
-    subCondition: offer?.SubCondition || "",
+    rawSubCondition,
+    subCondition,
+    isSubConditionMatched,
     priceSource: "Offers"
   };
 }
@@ -406,8 +504,6 @@ function normalizeLowestPrice(lp) {
   const points = extractPointsNumber(lp?.Points ?? lp?.points);
   const coupon = null;
 
-  // Summary.LowestPrices の LandedPrice は、JPでは ListingPrice + Shipping - Points の形で返ることがあります。
-  // そのため LandedPrice が返ってきている場合はAPI値を優先します。
   const landedPrice =
     landedPriceFromApi !== null
       ? landedPriceFromApi
@@ -429,6 +525,18 @@ function normalizeLowestPrice(lp) {
   else if (fulfillmentRaw === "Merchant") fulfillment = "MFN";
   else fulfillment = fulfillmentRaw || "";
 
+  const rawSubCondition =
+    lp?.SubCondition ??
+    lp?.subCondition ??
+    lp?.Condition ??
+    lp?.condition ??
+    "";
+
+  const subCondition = normalizeSubCondition(rawSubCondition);
+
+  // Summary.LowestPrices は状態別価格の判定が弱いため、原則マッチ扱いにしない。
+  const isSubConditionMatched = false;
+
   return {
     listingPrice,
     shippingPrice,
@@ -440,27 +548,34 @@ function normalizeLowestPrice(lp) {
     fulfillment,
     isBuyBoxWinner: false,
     isFeaturedMerchant: false,
-    subCondition: lp?.condition || lp?.Condition || "",
+    rawSubCondition,
+    subCondition,
+    isSubConditionMatched,
     priceSource: "Summary.LowestPrices"
   };
 }
 
-function pickBestOffer(offers) {
+function sortByEffectivePrice(a, b) {
+  if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
+  if (a.isBuyBoxWinner && !b.isBuyBoxWinner) return -1;
+  if (!a.isBuyBoxWinner && b.isBuyBoxWinner) return 1;
+  return a.landedPrice - b.landedPrice;
+}
+
+function pickBestOffer(offers, requiredOnly = false) {
   if (!Array.isArray(offers) || offers.length === 0) return null;
 
-  const normalized = offers
+  let normalized = offers
     .map(normalizeOffer)
     .filter((o) => o.landedPrice !== null);
 
+  if (requiredOnly) {
+    normalized = normalized.filter((o) => o.isSubConditionMatched);
+  }
+
   if (normalized.length === 0) return null;
 
-  normalized.sort((a, b) => {
-    if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
-    if (a.isBuyBoxWinner && !b.isBuyBoxWinner) return -1;
-    if (!a.isBuyBoxWinner && b.isBuyBoxWinner) return 1;
-    return a.landedPrice - b.landedPrice;
-  });
-
+  normalized.sort(sortByEffectivePrice);
   return normalized[0];
 }
 
@@ -473,15 +588,11 @@ function pickBestLowestPrice(lowestPrices) {
 
   if (normalized.length === 0) return null;
 
-  normalized.sort((a, b) => {
-    if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
-    return a.landedPrice - b.landedPrice;
-  });
-
+  normalized.sort(sortByEffectivePrice);
   return normalized[0];
 }
 
-function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
+function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
   const statusCode =
     typeof batchItem?.status === "number"
       ? batchItem.status
@@ -507,9 +618,23 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
     num(payload?.TotalOfferCount) ??
     (Array.isArray(offers) ? offers.length : 0);
 
-  const bestOffer = pickBestOffer(offers);
+  const bestRequiredOffer = pickBestOffer(offers, true);
+  const bestAnyOffer = pickBestOffer(offers, false);
   const bestSummaryPrice = pickBestLowestPrice(lowestPrices);
-  const bestPrice = bestOffer || bestSummaryPrice;
+
+  let bestPrice = null;
+  let selectionReason = "";
+
+  if (bestRequiredOffer) {
+    bestPrice = bestRequiredOffer;
+    selectionReason = "required_subcondition_offer";
+  } else if (bestAnyOffer) {
+    bestPrice = bestAnyOffer;
+    selectionReason = "offer_without_required_subcondition";
+  } else if (bestSummaryPrice) {
+    bestPrice = bestSummaryPrice;
+    selectionReason = "summary_lowestprice";
+  }
 
   if (!bestPrice) {
     return {
@@ -532,16 +657,63 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
       source: `SP-API getItemOffersBatch / ${itemCondition}`,
       confidence: statusCode === 200 ? "low" : "api_error",
       avgPriceDiff: null,
+      avgPriceDiffRate: null,
+      pointRate: null,
       itemCondition,
+      rawSubCondition: "",
+      subCondition: "",
+      requiredSubConditions: REQUIRED_SUBCONDITIONS,
+      isSubConditionMatched: false,
+      priceSource: "",
+      isSaleGuard: false,
+      saleGuardReason: "",
+      useForRepricing: false,
+      selectionReason: "",
       memo: statusCode === 200
-        ? `Offers価格なし / LowestPrices価格なし / offerCount=${offerCount}`
+        ? `価格なし / offerCount=${offerCount}`
         : `API statusCode=${statusCode}`
     };
   }
 
-  const effective = bestPrice.effectivePrice;
-  const avg = num(masterItem.sourceAvgPrice);
-  const avgPriceDiff = effective !== null && avg !== null ? effective - avg : null;
+  const saleGuard = buildSaleGuard({
+    sourceAvgPrice: masterItem.sourceAvgPrice,
+    apiPrice: bestPrice.listingPrice,
+    effectivePrice: bestPrice.effectivePrice,
+    points: bestPrice.points
+  });
+
+  const summaryAllowed =
+    bestPrice.priceSource === "Summary.LowestPrices" &&
+    ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING;
+
+  const canUseForRepricing =
+    Boolean(masterItem.useForRepricing) &&
+    bestPrice.effectivePrice !== null &&
+    (
+      bestPrice.isSubConditionMatched ||
+      summaryAllowed
+    ) &&
+    !saleGuard.isSaleGuard;
+
+  let memo = "";
+
+  if (bestPrice.priceSource === "Offers") {
+    if (bestPrice.isSubConditionMatched) {
+      memo = bestPrice.isBuyBoxWinner
+        ? "Offers / required subCondition / BuyBoxWinner offer"
+        : "Offers / required subCondition / lowest effective offer";
+    } else {
+      memo = `Offers / subCondition not matched. raw=${bestPrice.rawSubCondition || "(empty)"}`;
+    }
+  } else {
+    memo = ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING
+      ? "Summary.LowestPrices / allowed by env"
+      : "Summary.LowestPrices由来。状態別価格が不明のため自動価格調整対象外";
+  }
+
+  if (saleGuard.isSaleGuard) {
+    memo += ` / sale_guard: ${saleGuard.saleGuardReason}`;
+  }
 
   return {
     checkedAt: new Date().toISOString(),
@@ -561,13 +733,26 @@ function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
     availability: "offer_found",
     offerCount,
     source: `SP-API getItemOffersBatch / ${itemCondition}`,
-    confidence: bestPrice.priceSource === "Offers" ? "high" : "medium",
-    avgPriceDiff,
+    confidence:
+      bestPrice.priceSource === "Offers" && bestPrice.isSubConditionMatched
+        ? "high"
+        : bestPrice.priceSource === "Offers"
+          ? "medium"
+          : "medium",
+    avgPriceDiff: saleGuard.avgPriceDiff,
+    avgPriceDiffRate: saleGuard.avgPriceDiffRate,
+    pointRate: saleGuard.pointRate,
     itemCondition,
-    memo:
-      bestPrice.priceSource === "Offers"
-        ? (bestPrice.isBuyBoxWinner ? "Offers / BuyBoxWinner offer" : "Offers / lowest effective offer")
-        : "Summary.LowestPrices / lowest landed price"
+    rawSubCondition: bestPrice.rawSubCondition || "",
+    subCondition: bestPrice.subCondition || "",
+    requiredSubConditions: REQUIRED_SUBCONDITIONS,
+    isSubConditionMatched: Boolean(bestPrice.isSubConditionMatched),
+    priceSource: bestPrice.priceSource,
+    isSaleGuard: saleGuard.isSaleGuard,
+    saleGuardReason: saleGuard.saleGuardReason,
+    useForRepricing: canUseForRepricing,
+    selectionReason,
+    memo
   };
 }
 
@@ -606,7 +791,7 @@ async function fetchBenchmarkPrices() {
 
     remainingItems.forEach((masterItem, i) => {
       const batchItem = responses[i] || {};
-      const parsed = parseBatchResponseForItem(masterItem, batchItem, itemCondition);
+      const parsed = buildFinalPriceResult(masterItem, batchItem, itemCondition);
 
       if (parsed.availability === "offer_found" || idx === PRICING_ITEM_CONDITIONS.length - 1) {
         finalResultsByAsin.set(masterItem.asin, parsed);
@@ -635,7 +820,18 @@ async function fetchBenchmarkPrices() {
       source: "SP-API getItemOffersBatch",
       confidence: "none",
       avgPriceDiff: null,
+      avgPriceDiffRate: null,
+      pointRate: null,
       itemCondition: "",
+      rawSubCondition: "",
+      subCondition: "",
+      requiredSubConditions: REQUIRED_SUBCONDITIONS,
+      isSubConditionMatched: false,
+      priceSource: "",
+      isSaleGuard: false,
+      saleGuardReason: "",
+      useForRepricing: false,
+      selectionReason: "",
       memo: "価格取得処理に到達しませんでした"
     };
   });
@@ -776,7 +972,8 @@ app.get("/pricing-test/:asin", async (req, res) => {
       asin,
       productName: `TEST ${asin}`,
       sourceAvgPrice: null,
-      useForPriceMonitor: true
+      useForPriceMonitor: true,
+      useForRepricing: true
     };
 
     const results = [];
@@ -798,7 +995,7 @@ app.get("/pricing-test/:asin", async (req, res) => {
       });
 
       const response = (json?.responses || json?.Responses || [])[0] || {};
-      results.push(parseBatchResponseForItem(testItem, response, itemCondition));
+      results.push(buildFinalPriceResult(testItem, response, itemCondition));
     }
 
     return res.status(200).json(results);
@@ -806,6 +1003,40 @@ app.get("/pricing-test/:asin", async (req, res) => {
     console.error("❌ Error in /pricing-test/:asin:", err);
     return res.status(500).json({
       error: "pricing-test error",
+      message: err.message || String(err)
+    });
+  }
+});
+
+// rawレスポンス確認用。価格やSubConditionの場所を確認したいときだけ使う。
+app.get("/pricing-raw/:asin", async (req, res) => {
+  try {
+    const asin = String(req.params.asin || "").trim();
+    if (!asin) {
+      return res.status(400).json({ error: "ASIN is required" });
+    }
+
+    const accessToken = await getLwaAccessToken();
+
+    const testItem = {
+      asin
+    };
+
+    const itemCondition = PRICING_ITEM_CONDITIONS[0] || "Refurbished";
+    const body = buildItemOffersBatchRequest([testItem], itemCondition);
+
+    const json = await spApiRequest({
+      method: "POST",
+      path: "/batches/products/pricing/v0/itemOffers",
+      body,
+      accessToken
+    });
+
+    return res.status(200).json(json);
+  } catch (err) {
+    console.error("❌ Error in /pricing-raw/:asin:", err);
+    return res.status(500).json({
+      error: "pricing-raw error",
       message: err.message || String(err)
     });
   }
@@ -997,10 +1228,14 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-benchmark-prices-lwa-v3-points-lowestprices",
+    version: "2026-05-11-benchmark-prices-lwa-v4-subcondition-guard",
     marketplaceId: MARKETPLACE_ID,
     endpoint: SPAPI_ENDPOINT,
-    pricingConditions: PRICING_ITEM_CONDITIONS
+    pricingConditions: PRICING_ITEM_CONDITIONS,
+    requiredSubConditions: REQUIRED_SUBCONDITIONS,
+    allowSummaryLowestPriceForRepricing: ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING,
+    saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
+    saleGuardPointRate: SALE_GUARD_POINT_RATE
   });
 });
 

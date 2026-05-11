@@ -12,27 +12,31 @@ const REFRESH_TOKEN     = process.env.REFRESH_TOKEN;
 const MARKETPLACE_ID    = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528"; // JP
 const SPAPI_ENDPOINT    = process.env.SPAPI_ENDPOINT || "https://sellingpartnerapi-fe.amazon.com";
 
-// 価格取得条件。
-// Render Environment Variables に PRICING_ITEM_CONDITIONS=Refurbished を追加。
-// 取れない場合は Refurbished,Used に変更して検証。
+// 価格取得条件
 const PRICING_ITEM_CONDITIONS = (process.env.PRICING_ITEM_CONDITIONS || "Refurbished")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// 自動価格調整に使うサブコンディション。
-// Amazon APIでは英語で返る想定：Very Good / Good / Acceptable など。
+// Offers配列が返る場合に使うサブコンディション
 const REQUIRED_SUBCONDITIONS = (process.env.REQUIRED_SUBCONDITIONS || "Very Good")
   .split(",")
   .map((s) => normalizeSubCondition(s))
   .filter(Boolean);
 
-// Summary.LowestPrices は状態別価格が不明になりやすいため、初期値は false 推奨。
+// Summary.LowestPrices で優先する condition
+// Refurbished商品では、画面上の「整備済み品 - 非常に良い」がAPI上 condition:new として見えるケースがあるため。
+const REQUIRED_SUMMARY_CONDITIONS = (process.env.REQUIRED_SUMMARY_CONDITIONS || "new")
+  .split(",")
+  .map((s) => normalizeApiCondition(s))
+  .filter(Boolean);
+
+// Summary.LowestPrices のうち required summary condition に合わない価格も価格調整に使うか。
+// 基本は false 推奨。
 const ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING =
   String(process.env.ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING || "false").toLowerCase() === "true";
 
-// セール・異常値ガード。
-// 資料平均比 -15%以下、またはポイント率3%以上なら自動価格調整から除外。
+// セール・異常値ガード
 const SALE_GUARD_AVG_DROP_RATE = Number(process.env.SALE_GUARD_AVG_DROP_RATE || "-0.15");
 const SALE_GUARD_POINT_RATE    = Number(process.env.SALE_GUARD_POINT_RATE || "0.03");
 
@@ -204,13 +208,16 @@ function safeJsonParse(text) {
   }
 }
 
-function normalizeSubCondition(value) {
-  const s = String(value || "")
+function normalizeApiCondition(value) {
+  return String(value || "")
     .trim()
     .toLowerCase()
     .replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ");
+}
 
+function normalizeSubCondition(value) {
+  const s = normalizeApiCondition(value);
   if (!s) return "";
 
   if (s === "very good" || s === "verygood" || s === "非常に良い" || s === "非常に良い品") {
@@ -239,11 +246,11 @@ function isRequiredSubConditionMatched(subCondition) {
   return REQUIRED_SUBCONDITIONS.includes(normalized);
 }
 
-function calcRate(numerator, denominator) {
-  const a = num(numerator);
-  const b = num(denominator);
-  if (a === null || b === null || b === 0) return null;
-  return a / b;
+function isRequiredSummaryConditionMatched(summaryCondition) {
+  if (REQUIRED_SUMMARY_CONDITIONS.length === 0) return true;
+  const normalized = normalizeApiCondition(summaryCondition);
+  if (!normalized) return false;
+  return REQUIRED_SUMMARY_CONDITIONS.includes(normalized);
 }
 
 function buildSaleGuard({ sourceAvgPrice, apiPrice, effectivePrice, points }) {
@@ -428,19 +435,6 @@ function extractAmount(moneyObj) {
   return num(moneyObj.Amount ?? moneyObj.amount);
 }
 
-function extractPointsValue(offer) {
-  const points = offer?.Points || offer?.points;
-  if (!points) return null;
-
-  const pointsNumber = num(points.PointsNumber ?? points.pointsNumber);
-  if (pointsNumber !== null) return pointsNumber;
-
-  const monetaryValue = extractAmount(points.PointsMonetaryValue ?? points.pointsMonetaryValue);
-  if (monetaryValue !== null) return monetaryValue;
-
-  return null;
-}
-
 function extractPointsNumber(pointsObj) {
   if (!pointsObj) return null;
 
@@ -462,7 +456,7 @@ function normalizeOffer(offer) {
   const shippingPrice = extractAmount(offer?.Shipping ?? offer?.shipping) ?? 0;
   const landedPrice = listingPrice !== null ? listingPrice + shippingPrice : null;
 
-  const points = extractPointsValue(offer);
+  const points = extractPointsNumber(offer?.Points ?? offer?.points);
   const coupon = null;
 
   const effectivePrice = landedPrice !== null
@@ -492,6 +486,9 @@ function normalizeOffer(offer) {
     rawSubCondition,
     subCondition,
     isSubConditionMatched,
+    rawSummaryCondition: "",
+    summaryCondition: "",
+    isSummaryConditionMatched: false,
     priceSource: "Offers"
   };
 }
@@ -525,17 +522,13 @@ function normalizeLowestPrice(lp) {
   else if (fulfillmentRaw === "Merchant") fulfillment = "MFN";
   else fulfillment = fulfillmentRaw || "";
 
-  const rawSubCondition =
-    lp?.SubCondition ??
-    lp?.subCondition ??
-    lp?.Condition ??
+  const rawSummaryCondition =
     lp?.condition ??
+    lp?.Condition ??
     "";
 
-  const subCondition = normalizeSubCondition(rawSubCondition);
-
-  // Summary.LowestPrices は状態別価格の判定が弱いため、原則マッチ扱いにしない。
-  const isSubConditionMatched = false;
+  const summaryCondition = normalizeApiCondition(rawSummaryCondition);
+  const isSummaryConditionMatched = isRequiredSummaryConditionMatched(summaryCondition);
 
   return {
     listingPrice,
@@ -548,9 +541,12 @@ function normalizeLowestPrice(lp) {
     fulfillment,
     isBuyBoxWinner: false,
     isFeaturedMerchant: false,
-    rawSubCondition,
-    subCondition,
-    isSubConditionMatched,
+    rawSubCondition: "",
+    subCondition: "",
+    isSubConditionMatched: false,
+    rawSummaryCondition,
+    summaryCondition,
+    isSummaryConditionMatched,
     priceSource: "Summary.LowestPrices"
   };
 }
@@ -579,12 +575,16 @@ function pickBestOffer(offers, requiredOnly = false) {
   return normalized[0];
 }
 
-function pickBestLowestPrice(lowestPrices) {
+function pickBestLowestPrice(lowestPrices, requiredOnly = false) {
   if (!Array.isArray(lowestPrices) || lowestPrices.length === 0) return null;
 
-  const normalized = lowestPrices
+  let normalized = lowestPrices
     .map(normalizeLowestPrice)
     .filter((o) => o.landedPrice !== null);
+
+  if (requiredOnly) {
+    normalized = normalized.filter((o) => o.isSummaryConditionMatched);
+  }
 
   if (normalized.length === 0) return null;
 
@@ -619,8 +619,9 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
     (Array.isArray(offers) ? offers.length : 0);
 
   const bestRequiredOffer = pickBestOffer(offers, true);
+  const bestRequiredSummaryPrice = pickBestLowestPrice(lowestPrices, true);
   const bestAnyOffer = pickBestOffer(offers, false);
-  const bestSummaryPrice = pickBestLowestPrice(lowestPrices);
+  const bestAnySummaryPrice = pickBestLowestPrice(lowestPrices, false);
 
   let bestPrice = null;
   let selectionReason = "";
@@ -628,12 +629,15 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
   if (bestRequiredOffer) {
     bestPrice = bestRequiredOffer;
     selectionReason = "required_subcondition_offer";
+  } else if (bestRequiredSummaryPrice) {
+    bestPrice = bestRequiredSummaryPrice;
+    selectionReason = "required_summary_condition";
   } else if (bestAnyOffer) {
     bestPrice = bestAnyOffer;
     selectionReason = "offer_without_required_subcondition";
-  } else if (bestSummaryPrice) {
-    bestPrice = bestSummaryPrice;
-    selectionReason = "summary_lowestprice";
+  } else if (bestAnySummaryPrice) {
+    bestPrice = bestAnySummaryPrice;
+    selectionReason = "summary_without_required_condition";
   }
 
   if (!bestPrice) {
@@ -664,6 +668,10 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
       subCondition: "",
       requiredSubConditions: REQUIRED_SUBCONDITIONS,
       isSubConditionMatched: false,
+      rawSummaryCondition: "",
+      summaryCondition: "",
+      requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
+      isSummaryConditionMatched: false,
       priceSource: "",
       isSaleGuard: false,
       saleGuardReason: "",
@@ -682,7 +690,11 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
     points: bestPrice.points
   });
 
-  const summaryAllowed =
+  const requiredConditionMatched =
+    Boolean(bestPrice.isSubConditionMatched) ||
+    Boolean(bestPrice.isSummaryConditionMatched);
+
+  const summaryFallbackAllowed =
     bestPrice.priceSource === "Summary.LowestPrices" &&
     ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING;
 
@@ -690,8 +702,8 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
     Boolean(masterItem.useForRepricing) &&
     bestPrice.effectivePrice !== null &&
     (
-      bestPrice.isSubConditionMatched ||
-      summaryAllowed
+      requiredConditionMatched ||
+      summaryFallbackAllowed
     ) &&
     !saleGuard.isSaleGuard;
 
@@ -706,9 +718,13 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
       memo = `Offers / subCondition not matched. raw=${bestPrice.rawSubCondition || "(empty)"}`;
     }
   } else {
-    memo = ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING
-      ? "Summary.LowestPrices / allowed by env"
-      : "Summary.LowestPrices由来。状態別価格が不明のため自動価格調整対象外";
+    if (bestPrice.isSummaryConditionMatched) {
+      memo = `Summary.LowestPrices / required summary condition: ${bestPrice.summaryCondition}`;
+    } else if (ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING) {
+      memo = "Summary.LowestPrices / fallback allowed by env";
+    } else {
+      memo = `Summary.LowestPrices / summary condition not matched. raw=${bestPrice.rawSummaryCondition || "(empty)"}`;
+    }
   }
 
   if (saleGuard.isSaleGuard) {
@@ -736,8 +752,8 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
     confidence:
       bestPrice.priceSource === "Offers" && bestPrice.isSubConditionMatched
         ? "high"
-        : bestPrice.priceSource === "Offers"
-          ? "medium"
+        : bestPrice.priceSource === "Summary.LowestPrices" && bestPrice.isSummaryConditionMatched
+          ? "medium_high"
           : "medium",
     avgPriceDiff: saleGuard.avgPriceDiff,
     avgPriceDiffRate: saleGuard.avgPriceDiffRate,
@@ -747,6 +763,10 @@ function buildFinalPriceResult(masterItem, batchItem, itemCondition) {
     subCondition: bestPrice.subCondition || "",
     requiredSubConditions: REQUIRED_SUBCONDITIONS,
     isSubConditionMatched: Boolean(bestPrice.isSubConditionMatched),
+    rawSummaryCondition: bestPrice.rawSummaryCondition || "",
+    summaryCondition: bestPrice.summaryCondition || "",
+    requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
+    isSummaryConditionMatched: Boolean(bestPrice.isSummaryConditionMatched),
     priceSource: bestPrice.priceSource,
     isSaleGuard: saleGuard.isSaleGuard,
     saleGuardReason: saleGuard.saleGuardReason,
@@ -827,6 +847,10 @@ async function fetchBenchmarkPrices() {
       subCondition: "",
       requiredSubConditions: REQUIRED_SUBCONDITIONS,
       isSubConditionMatched: false,
+      rawSummaryCondition: "",
+      summaryCondition: "",
+      requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
+      isSummaryConditionMatched: false,
       priceSource: "",
       isSaleGuard: false,
       saleGuardReason: "",
@@ -1008,7 +1032,6 @@ app.get("/pricing-test/:asin", async (req, res) => {
   }
 });
 
-// rawレスポンス確認用。価格やSubConditionの場所を確認したいときだけ使う。
 app.get("/pricing-raw/:asin", async (req, res) => {
   try {
     const asin = String(req.params.asin || "").trim();
@@ -1018,10 +1041,7 @@ app.get("/pricing-raw/:asin", async (req, res) => {
 
     const accessToken = await getLwaAccessToken();
 
-    const testItem = {
-      asin
-    };
-
+    const testItem = { asin };
     const itemCondition = PRICING_ITEM_CONDITIONS[0] || "Refurbished";
     const body = buildItemOffersBatchRequest([testItem], itemCondition);
 
@@ -1228,11 +1248,12 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-benchmark-prices-lwa-v4-subcondition-guard",
+    version: "2026-05-11-benchmark-prices-lwa-v5-summary-new-priority",
     marketplaceId: MARKETPLACE_ID,
     endpoint: SPAPI_ENDPOINT,
     pricingConditions: PRICING_ITEM_CONDITIONS,
     requiredSubConditions: REQUIRED_SUBCONDITIONS,
+    requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
     allowSummaryLowestPriceForRepricing: ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING,
     saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
     saleGuardPointRate: SALE_GUARD_POINT_RATE

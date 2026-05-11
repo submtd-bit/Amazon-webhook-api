@@ -12,16 +12,141 @@ const REFRESH_TOKEN     = process.env.REFRESH_TOKEN;
 const MARKETPLACE_ID    = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528"; // JP
 const SPAPI_ENDPOINT    = process.env.SPAPI_ENDPOINT || "https://sellingpartnerapi-fe.amazon.com";
 
+// 価格取得条件。
+// Render Environment Variables に PRICING_ITEM_CONDITIONS=Refurbished を追加。
+// 取れない場合は Refurbished,Used に変更して検証。
+const PRICING_ITEM_CONDITIONS = (process.env.PRICING_ITEM_CONDITIONS || "Refurbished")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 // ---- 発送元固定（Render Environment Variables）----
-// 荷送人電話番号（サンプルの 03-5831-5923 のほう）
 const SHIPPER_TEL   = process.env.SHIPPER_TEL || "";
-// ご依頼主電話番号（サンプルの 0落ちしてた方＝本来 03-xxxx-xxxx）
 const REQUESTER_TEL = process.env.REQUESTER_TEL || "";
 
 const SENDER_POST   = process.env.SENDER_POST || "";
 const SENDER_ADDR1  = process.env.SENDER_ADDR1 || "";
 const SENDER_NAME1  = process.env.SENDER_NAME1 || ""; // 例: Amazon.co.jp
 const SENDER_NAME2  = process.env.SENDER_NAME2 || ""; // 例: MTDオンラインストア
+
+// -------------------- Benchmark Master --------------------
+// G83は16GB/SSD256GBのみ。512GB・8GB・S73疑いは除外。
+const BENCHMARK_MASTER = [
+  {
+    active: true,
+    group: "SV1",
+    targetSkuGroup: "SV1_16_256",
+    benchmarkRank: 1,
+    benchmarkRole: "同等競合",
+    asin: "B0G1C3YG3W",
+    productName: "CF-SV1 16GB/SSD256GB",
+    cpu: "i5-1145G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 20,
+    sourceAvgPrice: 50503,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "SV1 16GB/256GBの安値基準"
+  },
+  {
+    active: true,
+    group: "SV1",
+    targetSkuGroup: "SV1_16_256",
+    benchmarkRank: 2,
+    benchmarkRole: "同等競合",
+    asin: "B0GCZWBVLN",
+    productName: "CF-SV1 16GB/SSD256GB",
+    cpu: "i5-1145G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 9,
+    sourceAvgPrice: 62205,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "高価格でも売れているSV1競合"
+  },
+  {
+    active: true,
+    group: "SV1",
+    targetSkuGroup: "SV1_16_256",
+    benchmarkRank: 3,
+    benchmarkRole: "同等競合",
+    asin: "B0GPX1XN8Y",
+    productName: "CF-SV1 16GB/SSD256GB",
+    cpu: "i5-1145G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 4,
+    sourceAvgPrice: 59205,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "MTD想定価格に近いSV1競合"
+  },
+  {
+    active: true,
+    group: "G83",
+    targetSkuGroup: "G83_16_256",
+    benchmarkRank: 1,
+    benchmarkRole: "同等競合",
+    asin: "B0DR9BRG8B",
+    productName: "G83/HS 16GB/SSD256GB",
+    cpu: "i5-1135G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 33,
+    sourceAvgPrice: 55339,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "G83 16GB/256GBの主力競合"
+  },
+  {
+    active: true,
+    group: "G83",
+    targetSkuGroup: "G83_16_256",
+    benchmarkRank: 2,
+    benchmarkRole: "同等競合",
+    asin: "B0FKNK8SMZ",
+    productName: "G83 16GB/SSD256GB",
+    cpu: "i5-1135G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 6,
+    sourceAvgPrice: 46800,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "G83 16GB/256GBの安値寄り競合"
+  },
+  {
+    active: true,
+    group: "G83",
+    targetSkuGroup: "G83_16_256",
+    benchmarkRank: 3,
+    benchmarkRole: "同等競合",
+    asin: "B0GR429T3D",
+    productName: "G83 16GB/SSD256GB",
+    cpu: "i5-1135G7",
+    cpuGeneration: 11,
+    memoryGb: 16,
+    storageType: "SSD",
+    storageGb: 256,
+    sourceSalesUnits: 4,
+    sourceAvgPrice: 56090,
+    useForPriceMonitor: true,
+    useForRepricing: true,
+    memo: "G83 55,000円台の直接競合"
+  }
+];
 
 // -------------------- Utils --------------------
 function csvEscape(v) {
@@ -42,6 +167,25 @@ function joinNotEmpty(...parts) {
 function cut(s, n) {
   const str = (s ?? "").toString();
   return str.length > n ? str.slice(0, n) : str;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function num(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function safeJsonParse(text) {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return { rawText: text };
+  }
 }
 
 // -------------------- e飛伝Ⅲ header --------------------
@@ -67,59 +211,57 @@ const SAGAWA_HEADER = [
 
 function orderToSagawaRow(order) {
   const ship = order?.ShippingAddress || {};
-  const name = ship?.Name || ""; // 必須
+  const name = ship?.Name || "";
 
-  // 住所分割（推奨）
   const addr1 = joinNotEmpty(ship.StateOrRegion, ship.City);
   const addr2 = ship.AddressLine1 || "";
   const addr3 = joinNotEmpty(ship.AddressLine2, ship.AddressLine3);
 
-  // 品名（推奨）
   const items  = order.Items || [];
   const skus   = items.map((i) => i.SellerSKU).filter(Boolean).join(",");
   const titles = items.map((i) => i.Title).filter(Boolean).join(" / ");
 
   return [
-    "",          // お届け先コード取得区分（未使用）
-    "0",         // お届け先コード（サンプル踏襲）
+    "",
+    "0",
     ship.Phone || "",
     ship.PostalCode || "",
     addr1,
     addr2,
     addr3,
-    name,        // お届け先名称１
-    "",          // お届け先名称２
-    order.AmazonOrderId || "", // お客様管理番号
-    "",          // お客様コード
+    name,
+    "",
+    order.AmazonOrderId || "",
+    "",
 
-    "", "", "",  // 部署ご担当者（未使用）
-    SHIPPER_TEL, // 荷送人電話番号（固定）
+    "", "", "",
+    SHIPPER_TEL,
 
-    "",          // ご依頼主コード取得区分（未使用）
-    "",          // ご依頼主コード（未使用）
-    REQUESTER_TEL, // ご依頼主電話番号（固定）
+    "",
+    "",
+    REQUESTER_TEL,
     SENDER_POST,
     SENDER_ADDR1,
-    "",          // ご依頼主住所２
+    "",
     SENDER_NAME1,
     SENDER_NAME2,
 
-    "",          // 荷姿
-    "中古PC",    // 品名１（固定）
-    cut(skus, 60),    // 品名２
-    cut(titles, 60),  // 品名３
-    "", "",      // 品名４・５
+    "",
+    "中古PC",
+    cut(skus, 60),
+    cut(titles, 60),
+    "", "",
 
-    "", "", "", "", "", "", "", "", "", "", "", // 荷札系（未使用）
-    "1",         // 出荷個数（1個口固定）
-    "", "", "", "", "", // スピード/クール/配達日/時間帯/時分
-    "", "", "", "",     // 代引/税/決済/保険
-    "", "", "",         // 指定シール
-    "", "", "", "",     // 営業所受取等
-    "", "",             // メール/不在
-    "", "", "",         // 出荷日/問合せNo/出荷場印字
-    "",                 // 集約解除
-    "", "", "", "", "", "", "", "", "", "" // 編集01-10
+    "", "", "", "", "", "", "", "", "", "", "",
+    "1",
+    "", "", "", "", "",
+    "", "", "", "",
+    "", "", "",
+    "", "", "", "",
+    "", "",
+    "", "", "",
+    "",
+    "", "", "", "", "", "", "", "", "", ""
   ];
 }
 
@@ -136,8 +278,8 @@ async function getLwaAccessToken() {
       grant_type: "refresh_token",
       refresh_token: REFRESH_TOKEN,
       client_id: LWA_CLIENT_ID,
-      client_secret: LWA_CLIENT_SECRET,
-    }),
+      client_secret: LWA_CLIENT_SECRET
+    })
   });
 
   if (!res.ok) {
@@ -150,6 +292,270 @@ async function getLwaAccessToken() {
   return json.access_token;
 }
 
+// -------------------- 共通：SP-API request --------------------
+// 2023年10月以降のSP-APIはSigV4署名不要。LWA access tokenで呼ぶ。
+async function spApiRequest({ method = "GET", path, body = null, accessToken }) {
+  const bodyText = body ? JSON.stringify(body) : undefined;
+
+  const headers = {
+    "x-amz-access-token": accessToken,
+    accept: "application/json",
+    "user-agent": "amazon-webhook-api/1.0"
+  };
+
+  if (bodyText) {
+    headers["content-type"] = "application/json";
+  }
+
+  const res = await fetch(`${SPAPI_ENDPOINT}${path}`, {
+    method,
+    headers,
+    body: bodyText
+  });
+
+  const text = await res.text();
+  const json = safeJsonParse(text);
+
+  if (!res.ok) {
+    const detail = typeof json === "object" ? JSON.stringify(json) : text;
+    throw new Error(`SP-API request error: ${res.status} ${detail}`);
+  }
+
+  return json;
+}
+
+// -------------------- SP-API: Product Pricing --------------------
+function buildItemOffersBatchRequest(items, itemCondition) {
+  return {
+    requests: items.map((item) => ({
+      uri: `/products/pricing/v0/items/${encodeURIComponent(item.asin)}/offers`,
+      method: "GET",
+      MarketplaceId: MARKETPLACE_ID,
+      ItemCondition: itemCondition,
+      CustomerType: "Consumer"
+    }))
+  };
+}
+
+function extractAmount(moneyObj) {
+  if (!moneyObj) return null;
+  return num(moneyObj.Amount ?? moneyObj.amount);
+}
+
+function extractPointsValue(offer) {
+  const points = offer?.Points || offer?.points;
+  if (!points) return null;
+
+  const pointsNumber = num(points.PointsNumber ?? points.pointsNumber);
+  if (pointsNumber !== null) return pointsNumber;
+
+  const monetaryValue = extractAmount(points.PointsMonetaryValue ?? points.pointsMonetaryValue);
+  if (monetaryValue !== null) return monetaryValue;
+
+  return null;
+}
+
+function normalizeOffer(offer) {
+  const listingPrice = extractAmount(offer?.ListingPrice ?? offer?.listingPrice);
+  const shippingPrice = extractAmount(offer?.Shipping ?? offer?.shipping) ?? 0;
+  const landedPrice = listingPrice !== null ? listingPrice + shippingPrice : null;
+
+  // Amazonポイントは日本では基本的に1pt=1円扱いで実質価格から控除。
+  // 取れない場合はnull。
+  const points = extractPointsValue(offer);
+
+  // クーポンはSP-API Product Pricingから安定取得できない想定。
+  const coupon = null;
+
+  const effectivePrice = landedPrice !== null
+    ? landedPrice - (points || 0) - (coupon || 0)
+    : null;
+
+  return {
+    listingPrice,
+    shippingPrice,
+    landedPrice,
+    points,
+    coupon,
+    effectivePrice,
+    seller: offer?.SellerId || offer?.sellerId || "",
+    fulfillment: offer?.IsFulfilledByAmazon ? "AFN" : "MFN",
+    isBuyBoxWinner: Boolean(offer?.IsBuyBoxWinner),
+    isFeaturedMerchant: Boolean(offer?.IsFeaturedMerchant),
+    subCondition: offer?.SubCondition || ""
+  };
+}
+
+function pickBestOffer(offers) {
+  if (!Array.isArray(offers) || offers.length === 0) return null;
+
+  const normalized = offers
+    .map(normalizeOffer)
+    .filter((o) => o.landedPrice !== null);
+
+  if (normalized.length === 0) return null;
+
+  // 価格監視・自動価格調整のため、BuyBox優先ではなく「実質最安」を採用。
+  normalized.sort((a, b) => {
+    if (a.effectivePrice !== b.effectivePrice) return a.effectivePrice - b.effectivePrice;
+    if (a.isBuyBoxWinner && !b.isBuyBoxWinner) return -1;
+    if (!a.isBuyBoxWinner && b.isBuyBoxWinner) return 1;
+    return a.landedPrice - b.landedPrice;
+  });
+
+  return normalized[0];
+}
+
+function parseBatchResponseForItem(masterItem, batchItem, itemCondition) {
+  const statusCode =
+    batchItem?.status?.statusCode ??
+    batchItem?.Status?.StatusCode ??
+    batchItem?.statusCode ??
+    null;
+
+  const body = batchItem?.body || batchItem?.Body || {};
+  const payload = body?.payload || body?.Payload || body || {};
+
+  const offers = payload?.Offers || payload?.offers || [];
+  const summary = payload?.Summary || payload?.summary || {};
+
+  const offerCount =
+    num(summary?.TotalOfferCount) ??
+    num(payload?.TotalOfferCount) ??
+    (Array.isArray(offers) ? offers.length : 0);
+
+  const bestOffer = pickBestOffer(offers);
+
+  if (!bestOffer) {
+    return {
+      checkedAt: new Date().toISOString(),
+      group: masterItem.group,
+      targetSkuGroup: masterItem.targetSkuGroup,
+      asin: masterItem.asin,
+      productName: masterItem.productName,
+      sourceAvgPrice: masterItem.sourceAvgPrice,
+      apiPrice: null,
+      shippingPrice: null,
+      landedPrice: null,
+      points: null,
+      coupon: null,
+      effectivePrice: null,
+      seller: "",
+      fulfillment: "",
+      availability: offerCount > 0 ? "offer_summary_only" : "no_offer",
+      offerCount,
+      source: `SP-API getItemOffersBatch / ${itemCondition}`,
+      confidence: statusCode === 200 ? "low" : "api_error",
+      avgPriceDiff: null,
+      itemCondition,
+      memo: statusCode === 200
+        ? "Offers配列に価格がありませんでした"
+        : `API statusCode=${statusCode}`
+    };
+  }
+
+  const effective = bestOffer.effectivePrice;
+  const avg = num(masterItem.sourceAvgPrice);
+  const avgPriceDiff = effective !== null && avg !== null ? effective - avg : null;
+
+  return {
+    checkedAt: new Date().toISOString(),
+    group: masterItem.group,
+    targetSkuGroup: masterItem.targetSkuGroup,
+    asin: masterItem.asin,
+    productName: masterItem.productName,
+    sourceAvgPrice: masterItem.sourceAvgPrice,
+    apiPrice: bestOffer.listingPrice,
+    shippingPrice: bestOffer.shippingPrice,
+    landedPrice: bestOffer.landedPrice,
+    points: bestOffer.points,
+    coupon: bestOffer.coupon,
+    effectivePrice: bestOffer.effectivePrice,
+    seller: bestOffer.seller,
+    fulfillment: bestOffer.fulfillment,
+    availability: "offer_found",
+    offerCount,
+    source: `SP-API getItemOffersBatch / ${itemCondition}`,
+    confidence: "high",
+    avgPriceDiff,
+    itemCondition,
+    memo: bestOffer.isBuyBoxWinner ? "BuyBoxWinner offer" : "lowest effective offer"
+  };
+}
+
+async function fetchBenchmarkPrices() {
+  const accessToken = await getLwaAccessToken();
+
+  const activeItems = BENCHMARK_MASTER
+    .filter((item) => item.active && item.useForPriceMonitor)
+    .sort((a, b) => {
+      if (a.group !== b.group) return a.group.localeCompare(b.group);
+      return a.benchmarkRank - b.benchmarkRank;
+    });
+
+  const finalResultsByAsin = new Map();
+
+  for (let idx = 0; idx < PRICING_ITEM_CONDITIONS.length; idx += 1) {
+    const itemCondition = PRICING_ITEM_CONDITIONS[idx];
+
+    const remainingItems = activeItems.filter((item) => !finalResultsByAsin.has(item.asin));
+    if (remainingItems.length === 0) break;
+
+    // getItemOffersBatchはレート制限が低いので、複数conditionを試す場合は待つ。
+    if (idx > 0) {
+      await sleep(11000);
+    }
+
+    const body = buildItemOffersBatchRequest(remainingItems, itemCondition);
+
+    const json = await spApiRequest({
+      method: "POST",
+      path: "/batches/products/pricing/v0/itemOffers",
+      body,
+      accessToken
+    });
+
+    const responses = json?.responses || json?.Responses || [];
+
+    remainingItems.forEach((masterItem, i) => {
+      const batchItem = responses[i] || {};
+      const parsed = parseBatchResponseForItem(masterItem, batchItem, itemCondition);
+
+      // offer_foundなら確定。
+      // offerがない場合でも、最後のconditionなら結果として残す。
+      if (parsed.availability === "offer_found" || idx === PRICING_ITEM_CONDITIONS.length - 1) {
+        finalResultsByAsin.set(masterItem.asin, parsed);
+      }
+    });
+  }
+
+  return activeItems.map((item) => {
+    return finalResultsByAsin.get(item.asin) || {
+      checkedAt: new Date().toISOString(),
+      group: item.group,
+      targetSkuGroup: item.targetSkuGroup,
+      asin: item.asin,
+      productName: item.productName,
+      sourceAvgPrice: item.sourceAvgPrice,
+      apiPrice: null,
+      shippingPrice: null,
+      landedPrice: null,
+      points: null,
+      coupon: null,
+      effectivePrice: null,
+      seller: "",
+      fulfillment: "",
+      availability: "not_checked",
+      offerCount: 0,
+      source: "SP-API getItemOffersBatch",
+      confidence: "none",
+      avgPriceDiff: null,
+      itemCondition: "",
+      memo: "価格取得処理に到達しませんでした"
+    };
+  });
+}
+
 // -------------------- SP-API: orderItems --------------------
 async function getOrderItems(accessToken, orderId) {
   const r = await fetch(
@@ -158,8 +564,8 @@ async function getOrderItems(accessToken, orderId) {
       method: "GET",
       headers: {
         "x-amz-access-token": accessToken,
-        accept: "application/json",
-      },
+        accept: "application/json"
+      }
     }
   );
 
@@ -190,13 +596,12 @@ async function fetchOrdersWithItems(createdAfterIso) {
     `&CreatedAfter=${encodeURIComponent(createdAfterIso)}` +
     `&OrderStatuses=Unshipped&OrderStatuses=PartiallyShipped`;
 
-
   const ordersRes = await fetch(ordersUrl, {
     method: "GET",
     headers: {
       "x-amz-access-token": accessToken,
-      accept: "application/json",
-    },
+      accept: "application/json"
+    }
   });
 
   const text = await ordersRes.text();
@@ -207,7 +612,9 @@ async function fetchOrdersWithItems(createdAfterIso) {
 
   const ordersJson = text ? JSON.parse(text) : {};
   const rawOrders  = ordersJson?.payload?.Orders || [];
-　console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
+
+  console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
+
   const enriched = [];
   for (const o of rawOrders) {
     const items = await getOrderItems(accessToken, o.AmazonOrderId);
@@ -221,26 +628,25 @@ async function fetchOrdersWithItems(createdAfterIso) {
       BuyerEmail: o?.BuyerInfo?.BuyerEmail || "",
 
       ShippingAddress: {
-        Name:         o?.ShippingAddress?.Name || "",
-        Phone:        o?.ShippingAddress?.Phone || "",
-        PostalCode:   o?.ShippingAddress?.PostalCode || "",
-        StateOrRegion:o?.ShippingAddress?.StateOrRegion || "",
-        City:         o?.ShippingAddress?.City || "",
-        AddressLine1: o?.ShippingAddress?.AddressLine1 || "",
-        AddressLine2: o?.ShippingAddress?.AddressLine2 || "",
-        AddressLine3: o?.ShippingAddress?.AddressLine3 || "",
+        Name:          o?.ShippingAddress?.Name || "",
+        Phone:         o?.ShippingAddress?.Phone || "",
+        PostalCode:    o?.ShippingAddress?.PostalCode || "",
+        StateOrRegion: o?.ShippingAddress?.StateOrRegion || "",
+        City:          o?.ShippingAddress?.City || "",
+        AddressLine1:  o?.ShippingAddress?.AddressLine1 || "",
+        AddressLine2:  o?.ShippingAddress?.AddressLine2 || "",
+        AddressLine3:  o?.ShippingAddress?.AddressLine3 || ""
       },
 
       OrderTotal: o?.OrderTotal?.Amount ? Number(o.OrderTotal.Amount) : null,
       Currency:   o?.OrderTotal?.CurrencyCode || null,
 
-      Items: items,
+      Items: items
     });
   }
 
   return enriched;
 }
-
 
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => {
@@ -250,6 +656,78 @@ app.get("/health", (req, res) => {
 app.post("/webhook", (req, res) => {
   console.log("🔔 Webhook received:", req.body);
   res.status(200).json({ status: "ok" });
+});
+
+// 価格監視：Benchmark Master確認用
+app.get("/benchmark-master", (req, res) => {
+  res.status(200).json(BENCHMARK_MASTER);
+});
+
+// 価格監視：Amazon Product Pricing API
+app.get("/benchmark-prices", async (req, res) => {
+  try {
+    const prices = await fetchBenchmarkPrices();
+    return res.status(200).json(prices);
+  } catch (err) {
+    console.error("❌ Error in /benchmark-prices:", err);
+    return res.status(500).json({
+      error: "benchmark-prices error",
+      message: err.message || String(err)
+    });
+  }
+});
+
+// 価格監視：単一ASINテスト用
+// 例: /pricing-test/B0DR9BRG8B
+app.get("/pricing-test/:asin", async (req, res) => {
+  try {
+    const asin = String(req.params.asin || "").trim();
+    if (!asin) {
+      return res.status(400).json({ error: "ASIN is required" });
+    }
+
+    const accessToken = await getLwaAccessToken();
+    const testItem = {
+      active: true,
+      group: "TEST",
+      targetSkuGroup: "TEST",
+      benchmarkRank: 1,
+      asin,
+      productName: `TEST ${asin}`,
+      sourceAvgPrice: null,
+      useForPriceMonitor: true
+    };
+
+    const results = [];
+
+    for (let idx = 0; idx < PRICING_ITEM_CONDITIONS.length; idx += 1) {
+      const itemCondition = PRICING_ITEM_CONDITIONS[idx];
+
+      if (idx > 0) {
+        await sleep(11000);
+      }
+
+      const body = buildItemOffersBatchRequest([testItem], itemCondition);
+
+      const json = await spApiRequest({
+        method: "POST",
+        path: "/batches/products/pricing/v0/itemOffers",
+        body,
+        accessToken
+      });
+
+      const response = (json?.responses || json?.Responses || [])[0] || {};
+      results.push(parseBatchResponseForItem(testItem, response, itemCondition));
+    }
+
+    return res.status(200).json(results);
+  } catch (err) {
+    console.error("❌ Error in /pricing-test/:asin:", err);
+    return res.status(500).json({
+      error: "pricing-test error",
+      message: err.message || String(err)
+    });
+  }
 });
 
 // 切り分け用：単一注文
@@ -264,8 +742,8 @@ app.get("/order/:orderId", async (req, res) => {
         method: "GET",
         headers: {
           "x-amz-access-token": accessToken,
-          accept: "application/json",
-        },
+          accept: "application/json"
+        }
       }
     );
 
@@ -275,7 +753,7 @@ app.get("/order/:orderId", async (req, res) => {
       return res.status(r.status).json({
         error: "GetOrder error",
         status: r.status,
-        body: text,
+        body: text
       });
     }
 
@@ -296,7 +774,6 @@ app.get("/orders", async (req, res) => {
     const createdAfterIso = since.toISOString();
     const orders = await fetchOrdersWithItems(createdAfterIso);
 
-    // 既存GASに合わせた平坦化形式も残す（互換用）
     const simplified = orders.map((o) => ({
       AmazonOrderId: o.AmazonOrderId,
       PurchaseDate:  o.PurchaseDate,
@@ -314,7 +791,7 @@ app.get("/orders", async (req, res) => {
 
       OrderTotal: o.OrderTotal,
       Currency:   o.Currency,
-      Items:      o.Items,
+      Items:      o.Items
     }));
 
     return res.status(200).json(simplified);
@@ -338,16 +815,14 @@ app.get("/sagawa.csv", async (req, res) => {
     lines.push(SAGAWA_HEADER.map(csvEscape).join(","));
 
     for (const order of orders) {
-      // Nameが空でも落とさない。BuyerNameにフォールバック
       if (!order?.ShippingAddress?.Name) {
         order.ShippingAddress = order.ShippingAddress || {};
         order.ShippingAddress.Name = order.BuyerName || "（氏名不明）";
       }
-    
+
       const row = orderToSagawaRow(order);
       lines.push(row.map(csvEscape).join(","));
     }
-
 
     const csv = lines.join("\n");
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -376,8 +851,8 @@ app.post("/confirm-shipment", async (req, res) => {
         method: "GET",
         headers: {
           "x-amz-access-token": accessToken,
-          accept: "application/json",
-        },
+          accept: "application/json"
+        }
       }
     );
 
@@ -387,7 +862,7 @@ app.post("/confirm-shipment", async (req, res) => {
       return res.status(itemsRes.status).json({
         error: "getOrderItems error",
         status: itemsRes.status,
-        body: itemsText,
+        body: itemsText
       });
     }
 
@@ -406,8 +881,8 @@ app.post("/confirm-shipment", async (req, res) => {
       shipDate,
       orderItems: orderItems.map((oi) => ({
         orderItemId: oi.OrderItemId,
-        quantity: oi.QuantityOrdered,
-      })),
+        quantity: oi.QuantityOrdered
+      }))
     };
 
     const body = { marketplaceId: MARKETPLACE_ID, packageDetail };
@@ -419,9 +894,9 @@ app.post("/confirm-shipment", async (req, res) => {
         headers: {
           "x-amz-access-token": accessToken,
           "content-type": "application/json",
-          accept: "application/json",
+          accept: "application/json"
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(body)
       }
     );
 
@@ -431,7 +906,7 @@ app.post("/confirm-shipment", async (req, res) => {
       return res.status(confirmRes.status).json({
         error: "confirmShipment error",
         status: confirmRes.status,
-        body: confirmText,
+        body: confirmText
       });
     }
 
@@ -445,7 +920,10 @@ app.post("/confirm-shipment", async (req, res) => {
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-01-04-1845", // ←ここを更新して目視確認
+    version: "2026-05-11-benchmark-prices-lwa-v1",
+    marketplaceId: MARKETPLACE_ID,
+    endpoint: SPAPI_ENDPOINT,
+    pricingConditions: PRICING_ITEM_CONDITIONS
   });
 });
 
@@ -454,6 +932,3 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
-
-
-

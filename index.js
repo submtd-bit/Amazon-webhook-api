@@ -11,6 +11,7 @@ const LWA_CLIENT_SECRET = process.env.LWA_CLIENT_SECRET;
 const REFRESH_TOKEN     = process.env.REFRESH_TOKEN;
 const MARKETPLACE_ID    = process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528"; // JP
 const SPAPI_ENDPOINT    = process.env.SPAPI_ENDPOINT || "https://sellingpartnerapi-fe.amazon.com";
+const SELLER_ID         = process.env.SPAPI_SELLER_ID;
 
 // 価格取得条件
 const PRICING_ITEM_CONDITIONS = (process.env.PRICING_ITEM_CONDITIONS || "Refurbished")

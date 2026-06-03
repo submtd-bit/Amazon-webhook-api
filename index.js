@@ -1442,6 +1442,84 @@ app.post("/confirm-shipment", async (req, res) => {
   }
 });
 
+// Amazon在庫更新 中継API
+app.post("/amazon/stock/update", async (req, res) => {
+  try {
+    const secret = req.headers["x-api-secret"];
+
+    if (!process.env.AMAZON_STOCK_API_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: "AMAZON_STOCK_API_SECRET is not set"
+      });
+    }
+
+    if (secret !== process.env.AMAZON_STOCK_API_SECRET) {
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized"
+      });
+    }
+
+    const { sku, quantity, dryRun } = req.body || {};
+
+    if (!sku) {
+      return res.status(400).json({
+        ok: false,
+        error: "sku is required"
+      });
+    }
+
+    if (quantity === undefined || quantity === null || quantity === "") {
+      return res.status(400).json({
+        ok: false,
+        error: "quantity is required"
+      });
+    }
+
+    const qty = Number(quantity);
+
+    if (!Number.isFinite(qty) || qty < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "quantity must be a non-negative number"
+      });
+    }
+
+    // まずは疎通確認のみ。Amazon SP-APIへは送らない。
+    if (dryRun) {
+      console.log("✅ Amazon stock dryRun:", {
+        sku,
+        quantity: qty
+      });
+
+      return res.status(200).json({
+        ok: true,
+        dryRun: true,
+        sku,
+        quantity: qty,
+        message: "DRY RUN OK"
+      });
+    }
+
+    // 本番更新は次ステップで実装
+    return res.status(501).json({
+      ok: false,
+      dryRun: false,
+      sku,
+      quantity: qty,
+      error: "Live Amazon stock update is not implemented yet"
+    });
+
+  } catch (err) {
+    console.error("❌ Error in /amazon/stock/update:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || String(err)
+    });
+  }
+});
+
 app.get("/version", (req, res) => {
   res.status(200).json({
     version: "2026-05-11-orders-address-v6",

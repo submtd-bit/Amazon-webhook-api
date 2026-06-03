@@ -423,6 +423,49 @@ async function spApiRequest({ method = "GET", path, body = null, accessToken }) 
   return json;
 }
 
+async function updateAmazonListingQuantity({ sku, quantity }) {
+  if (!SELLER_ID) {
+    throw new Error("Missing env: SPAPI_SELLER_ID");
+  }
+
+  if (!sku) {
+    throw new Error("sku is required");
+  }
+
+  const qty = Number(quantity);
+
+  if (!Number.isFinite(qty) || qty < 0) {
+    throw new Error("quantity must be a non-negative number");
+  }
+
+  const accessToken = await getLwaAccessToken();
+
+  const body = {
+    productType: "PRODUCT",
+    patches: [
+      {
+        op: "replace",
+        path: "/attributes/fulfillment_availability",
+        value: [
+          {
+            fulfillment_channel_code: "DEFAULT",
+            quantity: qty
+          }
+        ]
+      }
+    ]
+  };
+
+  return await spApiRequest({
+    method: "PATCH",
+    path:
+      `/listings/2021-08-01/items/${encodeURIComponent(SELLER_ID)}/${encodeURIComponent(sku)}` +
+      `?marketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}`,
+    body,
+    accessToken
+  });
+}
+
 // -------------------- SP-API: Product Pricing --------------------
 function buildItemOffersBatchRequest(items, itemCondition) {
   return {
@@ -1502,14 +1545,24 @@ app.post("/amazon/stock/update", async (req, res) => {
       });
     }
 
-    // 本番更新は次ステップで実装
-    return res.status(501).json({
-      ok: false,
-      dryRun: false,
-      sku,
-      quantity: qty,
-      error: "Live Amazon stock update is not implemented yet"
-    });
+const result = await updateAmazonListingQuantity({
+  sku,
+  quantity: qty
+});
+
+console.log("✅ Amazon stock live update:", {
+  sku,
+  quantity: qty,
+  result
+});
+
+return res.status(200).json({
+  ok: true,
+  dryRun: false,
+  sku,
+  quantity: qty,
+  result
+});
 
   } catch (err) {
     console.error("❌ Error in /amazon/stock/update:", err);
@@ -1531,6 +1584,8 @@ app.get("/version", (req, res) => {
     allowSummaryLowestPriceForRepricing: ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING,
     saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
     saleGuardPointRate: SALE_GUARD_POINT_RATE,
+    stockUpdateEndpoint: "/amazon/stock/update",
+    sellerIdConfigured: Boolean(SELLER_ID),
     ordersAddressEnabled: true,
     orderFullEndpoint: "/order-full/:orderId"
   });

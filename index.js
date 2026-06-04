@@ -1651,6 +1651,8 @@ function normalizeAmazonShipmentPayload(payload) {
   const amazonOrderId = String(payload.amazonOrderId || '').trim();
   const trackingNumber = String(payload.trackingNumber || '').replace(/[^\dA-Za-z-]/g, '').trim();
   const carrier = normalizeAmazonCarrierName(payload.carrier || 'Sagawa');
+  const shippingMethod = normalizeAmazonShippingMethod(payload.shippingMethod, carrier);
+
 
   const shipDate = String(payload.shipDate || '').trim();
   const fulfillmentDate = shipDate
@@ -1686,7 +1688,7 @@ function normalizeAmazonShipmentPayload(payload) {
   return {
     amazonOrderId,
     carrier,
-    shippingMethod: carrier,
+    shippingMethod,
     trackingNumber,
     fulfillmentDate,
     items: normalizedItems
@@ -1697,19 +1699,38 @@ function normalizeAmazonShipmentPayload(payload) {
 function normalizeAmazonCarrierName(value) {
   const text = String(value || '').trim().toLowerCase();
 
-  if (text.includes('sagawa') || text.includes('佐川')) {
-    return '佐川急便';
+  if (
+    text.includes('sagawa') ||
+    text.includes('佐川') ||
+    text.includes('飛脚')
+  ) {
+    return 'Sagawa';
   }
 
   if (text.includes('japan') || text.includes('日本郵便')) {
-    return '日本郵便';
+    return 'Japan Post';
   }
 
   if (text.includes('yamato') || text.includes('ヤマト')) {
-    return 'ヤマト運輸';
+    return 'Yamato Transport';
   }
 
-  return String(value || '佐川急便').trim();
+  return String(value || 'Sagawa').trim();
+}
+
+
+function normalizeAmazonShippingMethod(value, carrier) {
+  const text = String(value || '').trim();
+
+  if (
+    String(carrier || '').toLowerCase() === 'sagawa' ||
+    text.includes('佐川') ||
+    text.toLowerCase().includes('sagawa')
+  ) {
+    return 'Hikyaku Express';
+  }
+
+  return text || carrier || 'Hikyaku Express';
 }
 
 

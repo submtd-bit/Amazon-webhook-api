@@ -1598,3 +1598,280 @@ const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
 });
+
+app.post('/amazon/shipment/notify', async (req, res) => {
+  try {
+    const secret = req.headers['x-amazon-shipment-secret'];
+
+    if (!process.env.AMAZON_SHIPMENT_API_SECRET || secret !== process.env.AMAZON_SHIPMENT_API_SECRET) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Unauthorized'
+      });
+    }
+
+    const payload = req.body || {};
+    const normalized = normalizeAmazonShipmentPayload(payload);
+
+    const feedXml = buildAmazonOrderFulfillmentFeedXml(normalized);
+
+    if (payload.dryRun === true) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        message: 'Amazon shipment feed was not submitted.',
+        payload: normalized,
+        feedXml
+      });
+    }
+
+    const result = await submitAmazonOrderFulfillmentFeed(feedXml);
+
+    return res.json({
+      ok: true,
+      dryRun: false,
+      amazonOrderId: normalized.amazonOrderId,
+      trackingNumber: normalized.trackingNumber,
+      feedId: result.feedId,
+      feedDocumentId: result.feedDocumentId,
+      amazon: result
+    });
+
+  } catch (err) {
+    console.error('[Amazon shipment notify error]', err);
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message || String(err)
+    });
+  }
+});
+
+function normalizeAmazonShipmentPayload(payload) {
+  const amazonOrderId = String(payload.amazonOrderId || '').trim();
+  const trackingNumber = String(payload.trackingNumber || '').replace(/[^\dA-Za-z-]/g, '').trim();
+  const carrier = normalizeAmazonCarrierName(payload.carrier || 'Sagawa');
+
+  const shipDate = String(payload.shipDate || '').trim();
+  const fulfillmentDate = shipDate
+    ? `${shipDate}T12:00:00+09:00`
+    : new Date().toISOString();
+
+  const items = Array.isArray(payload.items) && payload.items.length > 0
+    ? payload.items
+    : [{
+        orderItemId: payload.orderItemId,
+        sellerSku: payload.sellerSku,
+        quantity: payload.quantity || 1
+      }];
+
+  const normalizedItems = items.map((item) => ({
+    orderItemId: String(item.orderItemId || '').trim(),
+    sellerSku: String(item.sellerSku || '').trim(),
+    quantity: toPositiveInt(item.quantity || 1)
+  })).filter((item) => item.orderItemId && item.quantity > 0);
+
+  if (!amazonOrderId) {
+    throw new Error('amazonOrderId is required');
+  }
+
+  if (!trackingNumber) {
+    throw new Error('trackingNumber is required');
+  }
+
+  if (normalizedItems.length === 0) {
+    throw new Error('items with orderItemId are required');
+  }
+
+  return {
+    amazonOrderId,
+    carrier,
+    shippingMethod: carrier,
+    trackingNumber,
+    fulfillmentDate,
+    items: normalizedItems
+  };
+}
+
+
+function normalizeAmazonCarrierName(value) {
+  const text = String(value || '').trim().toLowerCase();
+
+  if (text.includes('sagawa') || text.includes('佐川')) {
+    return '佐川急便';
+  }
+
+  if (text.includes('japan') || text.includes('日本郵便')) {
+    return '日本郵便';
+  }
+
+  if (text.includes('yamato') || text.includes('ヤマト')) {
+    return 'ヤマト運輸';
+  }
+
+  return String(value || '佐川急便').trim();
+}
+
+
+function toPositiveInt(value) {
+  const n = Number(String(value || '').replace(/[^\d]/g, ''));
+
+  if (!Number.isInteger(n) || n <= 0) {
+    return 1;
+  }
+
+  return n;
+}
+
+
+function buildAmazonOrderFulfillmentFeedXml(data) {
+  const merchantId = process.env.SPAPI_SELLER_ID || process.env.SELLER_ID || '';
+
+  if (!merchantId) {
+    throw new Error('SPAPI_SELLER_ID is not set');
+  }
+
+  const itemXml = data.items.map((item) => {
+    return (
+      '<Item>' +
+        '<AmazonOrderItemCode>' + escapeXml(item.orderItemId) + '</AmazonOrderItemCode>' +
+        '<Quantity>' + escapeXml(String(item.quantity)) + '</Quantity>' +
+      '</Item>'
+    );
+  }).join('');
+
+  return (
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">' +
+      '<Header>' +
+        '<DocumentVersion>1.01</DocumentVersion>' +
+        '<MerchantIdentifier>' + escapeXml(merchantId) + '</MerchantIdentifier>' +
+      '</Header>' +
+      '<MessageType>OrderFulfillment</MessageType>' +
+      '<Message>' +
+        '<MessageID>1</MessageID>' +
+        '<OperationType>Update</OperationType>' +
+        '<OrderFulfillment>' +
+          '<AmazonOrderID>' + escapeXml(data.amazonOrderId) + '</AmazonOrderID>' +
+          '<FulfillmentDate>' + escapeXml(data.fulfillmentDate) + '</FulfillmentDate>' +
+          '<FulfillmentData>' +
+            '<CarrierName>' + escapeXml(data.carrier) + '</CarrierName>' +
+            '<ShippingMethod>' + escapeXml(data.shippingMethod) + '</ShippingMethod>' +
+            '<ShipperTrackingNumber>' + escapeXml(data.trackingNumber) + '</ShipperTrackingNumber>' +
+          '</FulfillmentData>' +
+          itemXml +
+        '</OrderFulfillment>' +
+      '</Message>' +
+    '</AmazonEnvelope>'
+  );
+}
+
+
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+async function getAmazonAccessToken() {
+  const clientId = process.env.LWA_CLIENT_ID;
+  const clientSecret = process.env.LWA_CLIENT_SECRET;
+  const refreshToken = process.env.REFRESH_TOKEN;
+
+  if (!clientId) throw new Error('LWA_CLIENT_ID is not set');
+  if (!clientSecret) throw new Error('LWA_CLIENT_SECRET is not set');
+  if (!refreshToken) throw new Error('REFRESH_TOKEN is not set');
+
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('refresh_token', refreshToken);
+  params.append('client_id', clientId);
+  params.append('client_secret', clientSecret);
+
+  const response = await fetch('https://api.amazon.com/auth/o2/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params
+  });
+
+  const json = await response.json();
+
+  if (!response.ok || !json.access_token) {
+    throw new Error('Failed to get Amazon access token: ' + JSON.stringify(json));
+  }
+
+  return json.access_token;
+}
+
+
+async function submitAmazonOrderFulfillmentFeed(feedXml) {
+  const endpoint = process.env.SPAPI_ENDPOINT;
+  const marketplaceId = process.env.SPAPI_MARKETPLACE_ID;
+
+  if (!endpoint) throw new Error('SPAPI_ENDPOINT is not set');
+  if (!marketplaceId) throw new Error('SPAPI_MARKETPLACE_ID is not set');
+
+  const accessToken = await getAmazonAccessToken();
+
+  const contentType = 'text/xml; charset=UTF-8';
+
+  const docResponse = await fetch(`${endpoint}/feeds/2021-06-30/documents`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-amz-access-token': accessToken
+    },
+    body: JSON.stringify({
+      contentType
+    })
+  });
+
+  const docJson = await docResponse.json();
+
+  if (!docResponse.ok || !docJson.feedDocumentId || !docJson.url) {
+    throw new Error('createFeedDocument failed: ' + JSON.stringify(docJson));
+  }
+
+  const uploadResponse = await fetch(docJson.url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': contentType
+    },
+    body: Buffer.from(feedXml, 'utf8')
+  });
+
+  const uploadText = await uploadResponse.text();
+
+  if (!uploadResponse.ok) {
+    throw new Error('Feed document upload failed: HTTP ' + uploadResponse.status + ' ' + uploadText);
+  }
+
+  const feedResponse = await fetch(`${endpoint}/feeds/2021-06-30/feeds`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-amz-access-token': accessToken
+    },
+    body: JSON.stringify({
+      feedType: 'POST_ORDER_FULFILLMENT_DATA',
+      marketplaceIds: [marketplaceId],
+      inputFeedDocumentId: docJson.feedDocumentId
+    })
+  });
+
+  const feedJson = await feedResponse.json();
+
+  if (!feedResponse.ok || !feedJson.feedId) {
+    throw new Error('createFeed failed: ' + JSON.stringify(feedJson));
+  }
+
+  return {
+    feedDocumentId: docJson.feedDocumentId,
+    feedId: feedJson.feedId
+  };
+}

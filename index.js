@@ -1002,13 +1002,13 @@ async function getOrderItems(accessToken, orderId) {
 }
 
 // -------------------- 共通：注文+住所+購入者+明細を取得 --------------------
-async function fetchOrdersWithItems(createdAfterIso) {
+async function fetchOrdersWithItems(lastUpdatedAfterIso) {
   const accessToken = await getLwaAccessToken();
 
   const ordersUrl =
     `${SPAPI_ENDPOINT}/orders/v0/orders?` +
     `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
-    `&CreatedAfter=${encodeURIComponent(createdAfterIso)}` +
+    `&LastUpdatedAfter=${encodeURIComponent(lastUpdatedAfterIso)}` +
     `&OrderStatuses=Unshipped&OrderStatuses=PartiallyShipped`;
 
   const ordersRes = await fetch(ordersUrl, {
@@ -1029,7 +1029,7 @@ async function fetchOrdersWithItems(createdAfterIso) {
   const ordersJson = text ? JSON.parse(text) : {};
   const rawOrders  = ordersJson?.payload?.Orders || [];
 
-  console.log("✅ rawOrders count:", rawOrders.length, "createdAfter:", createdAfterIso);
+  console.log("✅ rawOrders count:", rawOrders.length, "lastUpdatedAfter:", lastUpdatedAfterIso);
 
   const enriched = [];
 
@@ -1316,12 +1316,12 @@ app.get("/order-full/:orderId", async (req, res) => {
 // 注文一覧JSON
 app.get("/orders", async (req, res) => {
   try {
-    const since = req.query.createdAfter
-      ? new Date(req.query.createdAfter)
-      : new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const since = req.query.lastUpdatedAfter || req.query.createdAfter
+      ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
+      : new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
 
-    const createdAfterIso = since.toISOString();
-    const orders = await fetchOrdersWithItems(createdAfterIso);
+    const lastUpdatedAfterIso = since.toISOString();
+    const orders = await fetchOrdersWithItems(lastUpdatedAfterIso);
 
     const simplified = orders.map((o) => ({
       AmazonOrderId: o.AmazonOrderId,
@@ -1366,13 +1366,12 @@ app.get("/orders", async (req, res) => {
 // e飛伝Ⅲ取込用CSV
 app.get("/sagawa.csv", async (req, res) => {
   try {
-    const since = req.query.createdAfter
-      ? new Date(req.query.createdAfter)
-      : new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const since = req.query.lastUpdatedAfter || req.query.createdAfter
+      ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
+      : new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
 
-    const createdAfterIso = since.toISOString();
-    const orders = await fetchOrdersWithItems(createdAfterIso);
-
+    const lastUpdatedAfterIso = since.toISOString();
+    const orders = await fetchOrdersWithItems(lastUpdatedAfterIso);
     const lines = [];
     lines.push(SAGAWA_HEADER.map(csvEscape).join(","));
 

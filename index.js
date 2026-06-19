@@ -1147,6 +1147,67 @@ async function fetchOrdersWithItems(lastUpdatedAfterIso) {
   return enriched;
 }
 
+// -------------------- SP-API: canceled orders --------------------
+async function fetchCanceledOrdersWithItems(lastUpdatedAfterIso) {
+  const accessToken = await getLwaAccessToken();
+
+  const ordersUrl =
+    `${SPAPI_ENDPOINT}/orders/v0/orders?` +
+    `MarketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}` +
+    `&LastUpdatedAfter=${encodeURIComponent(lastUpdatedAfterIso)}` +
+    `&OrderStatuses=Canceled`;
+
+  const ordersRes = await fetch(ordersUrl, {
+    method: "GET",
+    headers: {
+      "x-amz-access-token": accessToken,
+      accept: "application/json"
+    }
+  });
+
+  const text = await ordersRes.text();
+
+  if (!ordersRes.ok) {
+    console.error("❌ Canceled Orders API error:", ordersRes.status, text);
+    throw new Error(`Canceled Orders API error: ${ordersRes.status} ${text}`);
+  }
+
+  const ordersJson = text ? JSON.parse(text) : {};
+  const rawOrders = ordersJson?.payload?.Orders || [];
+
+  console.log("✅ canceled rawOrders count:", rawOrders.length, "lastUpdatedAfter:", lastUpdatedAfterIso);
+
+  const enriched = [];
+
+  for (const o of rawOrders) {
+    const orderId = o.AmazonOrderId;
+
+    let items = [];
+    try {
+      items = await getOrderItems(accessToken, orderId);
+    } catch (e) {
+      console.error("❌ canceled getOrderItems failed:", orderId, e);
+      items = [];
+    }
+
+    enriched.push({
+      AmazonOrderId: orderId,
+      PurchaseDate: o.PurchaseDate || "",
+      LastUpdateDate: o.LastUpdateDate || "",
+      OrderStatus: o.OrderStatus || "",
+      FulfillmentChannel: o.FulfillmentChannel || "",
+      PaymentMethod: o.PaymentMethod || "",
+      LatestShipDate: o.LatestShipDate || "",
+      Items: items
+    });
+
+    await sleep(200);
+  }
+
+  return enriched;
+}
+
+
 // -------------------- Routes --------------------
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
@@ -1360,6 +1421,36 @@ app.get("/orders", async (req, res) => {
   } catch (err) {
     console.error("❌ Error in /orders:", err);
     return res.status(500).json({ error: err.message || "SP-API error" });
+  }
+});
+
+// キャンセル注文一覧JSON
+app.get("/orders/canceled", async (req, res) => {
+  try {
+    const since = req.query.lastUpdatedAfter || req.query.createdAfter
+      ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
+      : new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+
+    const lastUpdatedAfterIso = since.toISOString();
+    const orders = await fetchCanceledOrdersWithItems(lastUpdatedAfterIso);
+
+    const simplified = orders.map((o) => ({
+      AmazonOrderId: o.AmazonOrderId,
+      PurchaseDate: o.PurchaseDate,
+      LastUpdateDate: o.LastUpdateDate,
+      OrderStatus: o.OrderStatus,
+      FulfillmentChannel: o.FulfillmentChannel,
+      PaymentMethod: o.PaymentMethod,
+      LatestShipDate: o.LatestShipDate,
+      Items: o.Items
+    }));
+
+    return res.status(200).json(simplified);
+  } catch (err) {
+    console.error("❌ Error in /orders/canceled:", err);
+    return res.status(500).json({
+      error: err.message || "SP-API canceled orders error"
+    });
   }
 });
 
@@ -1585,6 +1676,7 @@ app.get("/version", (req, res) => {
     saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
     saleGuardPointRate: SALE_GUARD_POINT_RATE,
     stockUpdateEndpoint: "/amazon/stock/update",
+    canceledOrdersEndpoint: "/orders/canceled",
     sellerIdConfigured: Boolean(SELLER_ID),
     ordersAddressEnabled: true,
     orderFullEndpoint: "/order-full/:orderId"

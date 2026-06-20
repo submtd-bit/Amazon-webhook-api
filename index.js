@@ -1329,26 +1329,12 @@ app.get("/order/:orderId", async (req, res) => {
   });
 });
 
-// 切り分け用：単一注文の住所・購入者・明細を確認
+// 無効化済み：Amazon審査対応のため、住所・購入者情報を返す確認用エンドポイントは停止
 app.get("/order-full/:orderId", async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
-    const accessToken = await getLwaAccessToken();
-
-    const address = await getOrderAddress(accessToken, orderId);
-    const buyerInfo = await getOrderBuyerInfo(accessToken, orderId);
-    const items = await getOrderItems(accessToken, orderId);
-
-    return res.status(200).json({
-      AmazonOrderId: orderId,
-      address,
-      buyerInfo,
-      items
-    });
-  } catch (e) {
-    console.error("❌ Error in /order-full/:orderId", e);
-    return res.status(500).json({ error: e.message || String(e) });
-  }
+  return res.status(404).json({
+    ok: false,
+    error: "Not found"
+  });
 });
 
 // 注文一覧JSON

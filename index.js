@@ -1214,7 +1214,11 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/webhook", (req, res) => {
-  console.log("🔔 Webhook received:", req.body);
+  console.log("Webhook received:", {
+    hasBody: Boolean(req.body),
+    keys: req.body ? Object.keys(req.body) : []
+  });
+
   res.status(200).json({ status: "ok" });
 });
 
@@ -1317,39 +1321,12 @@ app.get("/pricing-raw/:asin", async (req, res) => {
   }
 });
 
-// 切り分け用：単一注文の基本情報
+// 無効化済み：Amazon審査対応のため、単一注文情報を返す確認用エンドポイントは停止
 app.get("/order/:orderId", async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
-    const accessToken = await getLwaAccessToken();
-
-    const r = await fetch(
-      `${SPAPI_ENDPOINT}/orders/v0/orders/${encodeURIComponent(orderId)}`,
-      {
-        method: "GET",
-        headers: {
-          "x-amz-access-token": accessToken,
-          accept: "application/json"
-        }
-      }
-    );
-
-    const text = await r.text();
-
-    if (!r.ok) {
-      console.error("❌ GetOrder error:", r.status, text);
-      return res.status(r.status).json({
-        error: "GetOrder error",
-        status: r.status,
-        body: text
-      });
-    }
-
-    return res.status(200).json(JSON.parse(text));
-  } catch (e) {
-    console.error("❌ Error in /order/:orderId", e);
-    return res.status(500).json({ error: e.message || String(e) });
-  }
+  return res.status(404).json({
+    ok: false,
+    error: "Not found"
+  });
 });
 
 // 切り分け用：単一注文の住所・購入者・明細を確認

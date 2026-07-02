@@ -167,6 +167,51 @@ const BENCHMARK_MASTER = [
 ];
 
 // -------------------- Utils --------------------
+
+function requireAmazonApiSecret(req, res, next) {
+  const expected = process.env.AMAZON_API_SECRET;
+
+  if (!expected) {
+    return res.status(500).json({
+      ok: false,
+      error: "AMAZON_API_SECRET is not set"
+    });
+  }
+
+  const actual =
+    req.headers["x-api-secret"] ||
+    req.headers["x-amazon-api-secret"] ||
+    "";
+
+  if (actual !== expected) {
+    console.warn("⚠️ Unauthorized Amazon API request:", {
+      method: req.method,
+      path: req.path
+    });
+
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized"
+    });
+  }
+
+  return next();
+}
+
+function safeErrorForClient(label) {
+  return {
+    ok: false,
+    error: label
+  };
+}
+
+function safeLogError(label, err) {
+  console.error(label, {
+    name: err?.name || "",
+    message: err?.message || String(err || "")
+  });
+}
+
 function csvEscape(v) {
   const s = (v ?? "").toString();
   if (s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r")) {
@@ -1222,11 +1267,11 @@ app.post("/webhook", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.get("/benchmark-master", (req, res) => {
+app.get("/benchmark-master", requireAmazonApiSecret, (req, res) => {
   res.status(200).json(BENCHMARK_MASTER);
 });
 
-app.get("/benchmark-prices", async (req, res) => {
+app.get("/benchmark-prices", requireAmazonApiSecret, async (req, res) => {
   try {
     const prices = await fetchBenchmarkPrices();
     return res.status(200).json(prices);
@@ -1239,7 +1284,7 @@ app.get("/benchmark-prices", async (req, res) => {
   }
 });
 
-app.get("/pricing-test/:asin", async (req, res) => {
+app.get("/pricing-test/:asin", requireAmazonApiSecret, async (req, res) => {
   try {
     const asin = String(req.params.asin || "").trim();
     if (!asin) {
@@ -1291,7 +1336,7 @@ app.get("/pricing-test/:asin", async (req, res) => {
   }
 });
 
-app.get("/pricing-raw/:asin", async (req, res) => {
+app.get("/pricing-raw/:asin", requireAmazonApiSecret, async (req, res) => {
   try {
     const asin = String(req.params.asin || "").trim();
     if (!asin) {
@@ -1338,7 +1383,7 @@ app.get("/order-full/:orderId", async (req, res) => {
 });
 
 // 注文一覧JSON
-app.get("/orders", async (req, res) => {
+app.get("/orders", requireAmazonApiSecret, async (req, res) => {
   try {
     const since = req.query.lastUpdatedAfter || req.query.createdAfter
       ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
@@ -1382,13 +1427,13 @@ app.get("/orders", async (req, res) => {
 
     return res.status(200).json(simplified);
   } catch (err) {
-    console.error("❌ Error in /orders:", err);
-    return res.status(500).json({ error: err.message || "SP-API error" });
+    safeLogError("❌ Error in /orders:", err);
+    return res.status(500).json(safeErrorForClient("orders error"));
   }
 });
 
 // キャンセル注文一覧JSON
-app.get("/orders/canceled", async (req, res) => {
+app.get("/orders/canceled", requireAmazonApiSecret, async (req, res) => {
   try {
     const since = req.query.lastUpdatedAfter || req.query.createdAfter
       ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
@@ -1410,15 +1455,13 @@ app.get("/orders/canceled", async (req, res) => {
 
     return res.status(200).json(simplified);
   } catch (err) {
-    console.error("❌ Error in /orders/canceled:", err);
-    return res.status(500).json({
-      error: err.message || "SP-API canceled orders error"
-    });
+    safeLogError("❌ Error in /orders/canceled:", err);
+    return res.status(500).json(safeErrorForClient("canceled orders error"));
   }
 });
 
 // e飛伝Ⅲ取込用CSV
-app.get("/sagawa.csv", async (req, res) => {
+app.get("/sagawa.csv", requireAmazonApiSecret, async (req, res) => {
   try {
     const since = req.query.lastUpdatedAfter || req.query.createdAfter
       ? new Date(req.query.lastUpdatedAfter || req.query.createdAfter)
@@ -1443,13 +1486,13 @@ app.get("/sagawa.csv", async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.status(200).send(csv);
   } catch (e) {
-    console.error("❌ Error in /sagawa.csv:", e);
-    res.status(500).send(e?.message || String(e));
+    safeLogError("❌ Error in /sagawa.csv:", e);
+    res.status(500).json(safeErrorForClient("sagawa csv error"));
   }
 });
 
 // 出荷通知
-app.post("/confirm-shipment", async (req, res) => {
+app.post("/confirm-shipment", requireAmazonApiSecret, async (req, res) => {
   try {
     const { orderId: rawOrderId, trackingNumber } = req.body;
 
@@ -1476,9 +1519,9 @@ app.post("/confirm-shipment", async (req, res) => {
     if (!itemsRes.ok) {
       console.error("❌ getOrderItems error:", itemsRes.status, itemsText);
       return res.status(itemsRes.status).json({
+        ok: false,
         error: "getOrderItems error",
-        status: itemsRes.status,
-        body: itemsText
+        status: itemsRes.status
       });
     }
 
@@ -1525,13 +1568,16 @@ app.post("/confirm-shipment", async (req, res) => {
     if (!confirmRes.ok) {
       console.error("❌ confirmShipment error:", confirmRes.status, confirmText);
       return res.status(confirmRes.status).json({
+        ok: false,
         error: "confirmShipment error",
-        status: confirmRes.status,
-        body: confirmText
+        status: confirmRes.status
       });
     }
 
-    console.log("✅ confirmShipment success:", orderId, confirmText);
+    console.log("✅ confirmShipment success:", {
+      orderId,
+      responseLength: confirmText ? confirmText.length : 0
+    });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("❌ Error in /confirm-shipment:", err);
@@ -1629,20 +1675,9 @@ return res.status(200).json({
 
 app.get("/version", (req, res) => {
   res.status(200).json({
-    version: "2026-05-11-orders-address-v6",
-    marketplaceId: MARKETPLACE_ID,
-    endpoint: SPAPI_ENDPOINT,
-    pricingConditions: PRICING_ITEM_CONDITIONS,
-    requiredSubConditions: REQUIRED_SUBCONDITIONS,
-    requiredSummaryConditions: REQUIRED_SUMMARY_CONDITIONS,
-    allowSummaryLowestPriceForRepricing: ALLOW_SUMMARY_LOWESTPRICE_FOR_REPRICING,
-    saleGuardAvgDropRate: SALE_GUARD_AVG_DROP_RATE,
-    saleGuardPointRate: SALE_GUARD_POINT_RATE,
-    stockUpdateEndpoint: "/amazon/stock/update",
-    canceledOrdersEndpoint: "/orders/canceled",
-    sellerIdConfigured: Boolean(SELLER_ID),
-    ordersAddressEnabled: true,
-    orderFullEndpoint: "/order-full/:orderId"
+    ok: true,
+    service: "amazon-webhook-api",
+    version: "2026-05-11-orders-address-v6"
   });
 });
 

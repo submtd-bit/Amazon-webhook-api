@@ -1,5 +1,5 @@
 /**
- * Render / Express routes for Amazon Ads Decision Engine v4.3.
+ * Render / Express routes for Amazon Ads Decision Engine v5.0.
  *
  * ES modules:
  *   import { registerAmazonAdsDecisionRoutes } from "./amazon_ads_routes.js";
@@ -189,76 +189,150 @@ function registerAmazonAdsDecisionRoutes(app, deps) {
     }
   });
 
-  app.post("/ads/listings/price", requireSecret, async (req, res) => {
+  app.get("/price/orders/capabilities", requireSecret, (req, res) => {
+    return res.json({
+      ordersApiVersion: "2026-01-01",
+      marketplaceId,
+      defaultLookbackDays: 45,
+      maxLookbackDays: 120,
+      maxPages: 20,
+      includesPii: false
+    });
+  });
+
+  app.post("/price/orders/snapshot", requireSecret, async (req, res) => {
     try {
-      const sku = String(req.body?.sku || "").trim();
-      const price = Number(req.body?.price);
-      const currency = String(req.body?.currency || "JPY");
-      const dryRun = Boolean(req.body?.dryRun);
+      const lookbackDays = clampInteger(req.body?.lookbackDays, 45, 7, 120);
+      const maxPages = clampInteger(req.body?.maxPages, 20, 1, 20);
+      const now = new Date();
+      const createdBefore = new Date(now.getTime() - 3 * 60 * 1000).toISOString();
+      const createdAfter = new Date(
+        now.getTime() - lookbackDays * 24 * 60 * 60 * 1000
+      ).toISOString();
 
-      if (!sku || !Number.isFinite(price) || price <= 0) {
-        return res.status(400).json({
-          error: "valid sku and positive price are required"
-        });
-      }
+      const orders = [];
+      let paginationToken = "";
+      let pages = 0;
 
-      const patchBody = {
-        productType: "PRODUCT",
-        patches: [
-          {
-            op: "replace",
-            path: "/attributes/purchasable_offer",
-            value: [
-              {
-                marketplace_id: marketplaceId,
-                currency,
-                audience: "ALL",
-                our_price: [
-                  {
-                    schedule: [
-                      {
-                        value_with_tax: price
-                      }
-                    ]
-                  }
-                ]
-              }
-            ]
-          }
-        ]
-      };
-
-      if (dryRun) {
-        return res.json({
-          status: "DRY_RUN",
-          sku,
-          price,
-          patchBody
-        });
-      }
-
-      const result = await spApiRequest({
-        method: "PATCH",
-        path:
-          `/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/` +
-          `${encodeURIComponent(sku)}`,
-        query: {
+      do {
+        const query = {
+          createdAfter,
+          createdBefore,
           marketplaceIds: marketplaceId,
-          issueLocale: "ja_JP"
-        },
-        body: patchBody
-      });
+          maxResultsPerPage: 100,
+          includedData: "PROCEEDS,FULFILLMENT,PROMOTION"
+        };
+        if (paginationToken) query.paginationToken = paginationToken;
+
+        const response = await spApiRequest({
+          method: "GET",
+          path: "/orders/2026-01-01/orders",
+          query
+        });
+
+        const pageOrders = Array.isArray(response?.orders)
+          ? response.orders
+          : [];
+        orders.push(...pageOrders);
+        pages += 1;
+        paginationToken = String(response?.pagination?.nextToken || "");
+
+        if (paginationToken && pages < maxPages) {
+          await sleep(150);
+        }
+      } while (paginationToken && pages < maxPages);
+
+      const items = normalizeOrdersSnapshot(orders);
 
       return res.json({
-        status: "ACCEPTED",
-        sku,
-        price,
-        result
+        ordersApiVersion: "2026-01-01",
+        marketplaceId,
+        createdAfter,
+        createdBefore,
+        lookbackDays,
+        pages,
+        partial: Boolean(paginationToken),
+        orderCount: orders.length,
+        count: items.length,
+        items
       });
     } catch (error) {
-      return res.status(500).json({ error: error.message });
+      return res.status(error.statusCode || 500).json({
+        error: error.message,
+        code: error.code || "ORDER_SNAPSHOT_ERROR"
+      });
     }
   });
+
+}
+function normalizeOrdersSnapshot(orders) {
+  const items = [];
+
+  for (const order of Array.isArray(orders) ? orders : []) {
+    const fulfillmentStatus = String(
+      order?.fulfillment?.fulfillmentStatus || ""
+    ).toUpperCase();
+    const fulfilledBy = String(order?.fulfillment?.fulfilledBy || "");
+    const orderItems = Array.isArray(order?.orderItems)
+      ? order.orderItems
+      : [];
+
+    for (const item of orderItems) {
+      const product = item?.product || {};
+      const quantityOrdered = numberOrZero(item?.quantityOrdered);
+      const unitPrice = moneyAmountOrNull(product?.price?.unitPrice);
+      const itemSubtotal = sumItemProceedsType(item?.proceeds?.breakdowns, "ITEM");
+      const promotionDiscount = Math.abs(
+        sumItemProceedsType(item?.proceeds?.breakdowns, "DISCOUNT")
+      );
+      const grossItemSales = unitPrice !== null
+        ? unitPrice * quantityOrdered
+        : itemSubtotal;
+
+      items.push({
+        orderId: String(order?.orderId || ""),
+        orderItemId: String(item?.orderItemId || ""),
+        orderDate: order?.createdTime || "",
+        lastUpdatedTime: order?.lastUpdatedTime || "",
+        fulfillmentStatus,
+        fulfilledBy,
+        marketplaceId: order?.salesChannel?.marketplaceId || "",
+        marketplaceName: order?.salesChannel?.marketplaceName || "",
+        sellerSku: String(product?.sellerSku || ""),
+        asin: String(product?.asin || ""),
+        title: String(product?.title || ""),
+        quantityOrdered,
+        quantityFulfilled: numberOrZero(item?.fulfillment?.quantityFulfilled),
+        unitPrice,
+        currency: product?.price?.unitPrice?.currencyCode || "JPY",
+        grossItemSales,
+        itemSubtotal,
+        promotionDiscount
+      });
+    }
+  }
+
+  return items;
+}
+
+function sumItemProceedsType(breakdowns, type) {
+  return (Array.isArray(breakdowns) ? breakdowns : [])
+    .filter((entry) => String(entry?.type || "").toUpperCase() === type)
+    .reduce((sum, entry) => sum + numberOrZero(entry?.subtotal?.amount), 0);
+}
+
+function moneyAmountOrNull(money) {
+  if (!money || money.amount === null || money.amount === undefined) {
+    return null;
+  }
+  const value = Number(money.amount);
+  return Number.isFinite(value) ? value : null;
+}
+
+function clampInteger(value, fallback, minimum, maximum) {
+  const numeric = Number(value);
+  const integer = Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
+  return Math.min(Math.max(integer, minimum), maximum);
 }
 
 async function fetchPricingBatchWithRetry(
@@ -578,4 +652,4 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export { registerAmazonAdsDecisionRoutes };
+export { registerAmazonAdsDecisionRoutes, normalizeOrdersSnapshot };

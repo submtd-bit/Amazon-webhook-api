@@ -1,10 +1,10 @@
 /**
  * Render / Express routes for Amazon Ads Decision Engine v4.
  *
- * Integration:
- *   const { registerAmazonAdsDecisionRoutes } = require('./amazon_ads_decision_routes');
+ * Integration (ES modules):
+ *   import { registerAmazonAdsDecisionRoutes } from "./amazon_ads_routes.js";
  *   registerAmazonAdsDecisionRoutes(app, {
- *     spApiRequest, // existing authenticated helper
+ *     spApiRequest: decisionSpApiRequest,
  *     sellerId: process.env.SPAPI_SELLER_ID,
  *     marketplaceId: process.env.SPAPI_MARKETPLACE_ID,
  *     apiSecret: process.env.AMAZON_STOCK_API_SECRET
@@ -205,4 +205,4 @@ function numberOrZero(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-module.exports = { registerAmazonAdsDecisionRoutes };
+export { registerAmazonAdsDecisionRoutes };

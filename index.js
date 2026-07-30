@@ -1,6 +1,7 @@
 import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
+import { registerAmazonAdsDecisionRoutes } from "./amazon_ads_routes.js";
 
 const app = express();
 app.use(express.json());
@@ -469,6 +470,34 @@ async function spApiRequest({ method = "GET", path, body = null, accessToken }) 
   return json;
 }
 
+async function decisionSpApiRequest({
+  method = "GET",
+  path,
+  query = null,
+  body = null
+}) {
+  const accessToken = await getLwaAccessToken();
+
+  const queryString = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value === null || value === undefined || value === "") continue;
+    queryString.set(key, String(value));
+  }
+
+  const finalPath = queryString.toString()
+    ? `${path}${path.includes("?") ? "&" : "?"}${queryString.toString()}`
+    : path;
+
+  return spApiRequest({
+    method,
+    path: finalPath,
+    body,
+    accessToken
+  });
+}
+
+
 async function updateAmazonListingQuantity({ sku, quantity }) {
   if (!SELLER_ID) {
     throw new Error("Missing env: SPAPI_SELLER_ID");
@@ -511,6 +540,13 @@ async function updateAmazonListingQuantity({ sku, quantity }) {
     accessToken
   });
 }
+
+registerAmazonAdsDecisionRoutes(app, {
+  spApiRequest: decisionSpApiRequest,
+  sellerId: process.env.SPAPI_SELLER_ID,
+  marketplaceId: process.env.SPAPI_MARKETPLACE_ID || "A1VC38T7YXB528",
+  apiSecret: process.env.AMAZON_STOCK_API_SECRET
+});
 
 // -------------------- SP-API: Product Pricing --------------------
 function buildItemOffersBatchRequest(items, itemCondition) {
@@ -621,6 +657,7 @@ function normalizeLowestPrice(lp) {
     lp?.condition ??
     lp?.Condition ??
     "";
+
 
   const summaryCondition = normalizeApiCondition(rawSummaryCondition);
   const isSummaryConditionMatched = isRequiredSummaryConditionMatched(summaryCondition);

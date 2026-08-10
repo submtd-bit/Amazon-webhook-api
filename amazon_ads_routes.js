@@ -1,6 +1,6 @@
 /**
- * Render / Express routes for Amazon Ads Decision Engine v6.1.2.
- * Adds read-only competitor ASIN price snapshots using Product Pricing getItemOffersBatch.
+ * Render / Express routes for Amazon Ads Decision Engine v6.1.3.
+ * Adds read-only competitor ASIN price snapshots and Catalog Items specification snapshots.
  */
 function registerAmazonAdsDecisionRoutes(app, deps) {
   const { spApiRequest, sellerId, marketplaceId, apiSecret } = deps;
@@ -168,6 +168,62 @@ function registerAmazonAdsDecisionRoutes(app, deps) {
     }
   });
 
+  // v6.1.3: read-only Catalog Items snapshot for own/competitor ASIN specification comparison.
+  app.post('/ads/catalog-items/snapshot', requireSecret, async (req, res) => {
+    try {
+      const asins = [...new Set((req.body?.asins || [])
+        .map(v => String(v || '').trim().toUpperCase())
+        .filter(v => /^B0[A-Z0-9]{8}$/.test(v)))];
+      if (!asins.length || asins.length > 100) {
+        return res.status(400).json({ error: 'asins must contain 1-100 valid ASINs' });
+      }
+
+      const items = [];
+      for (let index = 0; index < asins.length; index += 1) {
+        if (index > 0) await waitMs(250);
+        const asin = asins[index];
+        try {
+          const data = await spApiRequest({
+            method: 'GET',
+            path: `/catalog/2022-04-01/items/${encodeURIComponent(asin)}`,
+            query: {
+              marketplaceIds: marketplaceId,
+              includedData: 'attributes,summaries,productTypes'
+            }
+          });
+          items.push(normalizeCatalogItem(asin, data, marketplaceId));
+        } catch (error) {
+          items.push({
+            asin,
+            marketplaceId,
+            status: 'ERROR',
+            title: '',
+            brand: '',
+            model: '',
+            productType: '',
+            cpu: '',
+            cpuClass: '',
+            cpuGeneration: '',
+            memoryGb: '',
+            storageGb: '',
+            storageType: '',
+            screenInches: '',
+            operatingSystem: '',
+            office: '',
+            specCompleteness: 0,
+            source: 'Catalog Items v2022-04-01',
+            updatedAt: new Date().toISOString(),
+            error: error.message || String(error)
+          });
+        }
+      }
+
+      res.json({ items, count: items.length, marketplaceId, readOnly: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message || String(error) });
+    }
+  });
+
   app.post('/ads/listings/price', requireSecret, async (req, res) => {
     try {
       const sku = String(req.body?.sku || '').trim();
@@ -310,6 +366,238 @@ function normalizeConditionText(value) {
 function stringifyErrors(errors) {
   if (!errors) return '';
   try { return JSON.stringify(errors).slice(0, 1000); } catch (e) { return String(errors).slice(0, 1000); }
+}
+
+function normalizeCatalogItem(asin, data, marketplaceId) {
+  const summaries = Array.isArray(data?.summaries) ? data.summaries : [];
+  const summary = summaries.find(x => !x?.marketplaceId || x.marketplaceId === marketplaceId) || summaries[0] || {};
+  const productTypes = Array.isArray(data?.productTypes) ? data.productTypes : [];
+  const productTypeRow = productTypes.find(x => !x?.marketplaceId || x.marketplaceId === marketplaceId) || productTypes[0] || {};
+  const attrs = data?.attributes || {};
+
+  const title = firstText(summary.itemName, attrFirst(attrs, 'item_name'));
+  const brand = firstText(summary.brand, attrFirst(attrs, 'brand'), attrFirst(attrs, 'manufacturer'));
+  const model = firstText(attrFirst(attrs, 'model_name'), attrFirst(attrs, 'model_number'));
+  const productType = firstText(productTypeRow.productType, summary.productType);
+
+  const cpuModel = firstObject(attrs, 'cpu_model');
+  const cpu = firstText(
+    nestedFirstText(cpuModel, 'model_number'),
+    nestedFirstText(cpuModel, 'family'),
+    attrFirst(attrs, 'processor_model_number'),
+    attrFirst(attrs, 'processor_type'),
+    extractCpuText(title)
+  );
+  const cpuClass = extractCpuClass([cpu, title].filter(Boolean).join(' '));
+  const generationText = firstText(nestedFirstText(cpuModel, 'generation'), extractGenerationText([cpu, title].join(' ')));
+  const cpuGeneration = parseGenerationNumber(generationText);
+
+  const ramEntry = firstObject(attrs, 'ram_memory');
+  const memoryGb = firstPositiveNumber(
+    nestedMeasurement(ramEntry, 'installed_size', 'GB'),
+    measurementAttr(attrs, 'memory_storage_capacity', 'GB'),
+    extractMemoryGb(title)
+  );
+
+  const hardDisk = firstObject(attrs, 'hard_disk');
+  const storageGb = firstPositiveNumber(
+    nestedMeasurement(hardDisk, 'size', 'GB'),
+    measurementAttr(attrs, 'flash_memory', 'GB', 'installed_size'),
+    extractStorageGb(title)
+  );
+  const storageType = firstText(
+    nestedFirstText(hardDisk, 'description'),
+    /\bSSD\b/i.test(title) ? 'SSD' : '',
+    /\bHDD\b/i.test(title) ? 'HDD' : ''
+  );
+
+  const display = firstObject(attrs, 'display');
+  const screenInches = firstPositiveNumber(
+    nestedMeasurement(display, 'size', 'inches'),
+    extractScreenInches(title)
+  );
+  const operatingSystem = firstText(attrFirst(attrs, 'operating_system'), extractOperatingSystem(title));
+
+  const officeHaystack = [
+    title,
+    ...attrTextList(attrs, 'included_components'),
+    ...attrTextList(attrs, 'bullet_point'),
+    ...attrTextList(attrs, 'product_description')
+  ].join(' ');
+  const office = /(?:MS\s*)?Office\s*20\d{2}|Microsoft\s*Office/i.test(officeHaystack)
+    ? ((officeHaystack.match(/(?:MS\s*)?Office\s*20\d{2}|Microsoft\s*Office(?:\s*20\d{2})?/i) || [''])[0])
+    : '';
+
+  const keySpecs = [cpuClass, cpuGeneration, memoryGb, storageGb, storageType, screenInches];
+  const complete = keySpecs.filter(v => v !== '' && v !== 0 && v !== null && v !== undefined).length;
+
+  return {
+    asin,
+    marketplaceId,
+    status: title ? 'READY' : 'PARTIAL',
+    title,
+    brand,
+    model,
+    productType,
+    cpu,
+    cpuClass,
+    cpuGeneration: cpuGeneration || '',
+    memoryGb: memoryGb || '',
+    storageGb: storageGb || '',
+    storageType,
+    screenInches: screenInches || '',
+    operatingSystem,
+    office,
+    specCompleteness: complete / keySpecs.length,
+    source: 'Catalog Items v2022-04-01',
+    updatedAt: new Date().toISOString(),
+    error: ''
+  };
+}
+
+function firstObject(attrs, key) {
+  const list = Array.isArray(attrs?.[key]) ? attrs[key] : [];
+  return list.find(v => v && typeof v === 'object') || {};
+}
+
+function attrFirst(attrs, key) {
+  const list = Array.isArray(attrs?.[key]) ? attrs[key] : [];
+  for (const entry of list) {
+    if (entry == null) continue;
+    if (typeof entry === 'string' || typeof entry === 'number') return entry;
+    if (entry.value != null && typeof entry.value !== 'object') return entry.value;
+  }
+  return '';
+}
+
+function attrTextList(attrs, key) {
+  const list = Array.isArray(attrs?.[key]) ? attrs[key] : [];
+  return list.map(entry => {
+    if (entry == null) return '';
+    if (typeof entry === 'string' || typeof entry === 'number') return String(entry);
+    if (entry.value != null && typeof entry.value !== 'object') return String(entry.value);
+    return '';
+  }).filter(Boolean);
+}
+
+function nestedFirstText(obj, key) {
+  if (!obj || typeof obj !== 'object') return '';
+  const value = obj[key];
+  const list = Array.isArray(value) ? value : value != null ? [value] : [];
+  for (const entry of list) {
+    if (entry == null) continue;
+    if (typeof entry === 'string' || typeof entry === 'number') return String(entry);
+    if (entry.value != null && typeof entry.value !== 'object') return String(entry.value);
+  }
+  return '';
+}
+
+function nestedMeasurement(obj, key, desiredUnit) {
+  if (!obj || typeof obj !== 'object') return 0;
+  const list = Array.isArray(obj[key]) ? obj[key] : [];
+  for (const entry of list) {
+    const value = Number(entry?.value);
+    const unit = String(entry?.unit || desiredUnit || '').toUpperCase();
+    if (!Number.isFinite(value) || value <= 0) continue;
+    return convertStorageUnit(value, unit, desiredUnit);
+  }
+  return 0;
+}
+
+function measurementAttr(attrs, key, desiredUnit, nestedKey) {
+  const entries = Array.isArray(attrs?.[key]) ? attrs[key] : [];
+  for (const entry of entries) {
+    if (nestedKey) {
+      const value = nestedMeasurement(entry, nestedKey, desiredUnit);
+      if (value > 0) return value;
+    }
+    const n = Number(entry?.value);
+    if (Number.isFinite(n) && n > 0) return convertStorageUnit(n, String(entry?.unit || desiredUnit), desiredUnit);
+  }
+  return 0;
+}
+
+function convertStorageUnit(value, fromUnit, desiredUnit) {
+  const from = String(fromUnit || '').toUpperCase();
+  const desired = String(desiredUnit || '').toUpperCase();
+  if (desired !== 'GB') return value;
+  if (from === 'TB') return value * 1000;
+  if (from === 'MB') return value / 1000;
+  return value;
+}
+
+function firstText(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function firstPositiveNumber(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+function extractCpuText(text) {
+  const s = String(text || '');
+  return (s.match(/(?:Intel\s*)?Core\s*i[3579][\s-]*\d{3,5}[A-Z0-9-]*/i) ||
+    s.match(/Ryzen\s*[3579][\s-]*\d{3,5}[A-Z0-9-]*/i) || [''])[0];
+}
+
+function extractCpuClass(text) {
+  const s = String(text || '');
+  const intel = s.match(/Core\s*i([3579])/i);
+  if (intel) return `i${intel[1]}`;
+  const ryzen = s.match(/Ryzen\s*([3579])/i);
+  if (ryzen) return `Ryzen ${ryzen[1]}`;
+  return '';
+}
+
+function extractGenerationText(text) {
+  const s = String(text || '');
+  const jp = s.match(/第\s*(\d{1,2})\s*世代/i);
+  if (jp) return `第${jp[1]}世代`;
+  const cpu = s.match(/Core\s*i[3579][\s-]*(\d{4,5})/i);
+  if (cpu) {
+    const digits = cpu[1];
+    const generation = digits.length >= 5 ? Number(digits.slice(0, 2)) : Number(digits.charAt(0));
+    if (generation > 0 && generation < 30) return `第${generation}世代`;
+  }
+  return '';
+}
+
+function parseGenerationNumber(value) {
+  const m = String(value || '').match(/(\d{1,2})/);
+  return m ? Number(m[1]) : 0;
+}
+
+function extractMemoryGb(text) {
+  const s = String(text || '');
+  const explicit = s.match(/(?:RAM|メモリ)\s*[:：]?\s*(\d+)\s*GB/i);
+  if (explicit) return Number(explicit[1]);
+  return 0;
+}
+
+function extractStorageGb(text) {
+  const s = String(text || '');
+  const m = s.match(/(?:SSD|HDD|ストレージ)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(TB|GB)/i);
+  if (!m) return 0;
+  return String(m[2]).toUpperCase() === 'TB' ? Number(m[1]) * 1000 : Number(m[1]);
+}
+
+function extractScreenInches(text) {
+  const m = String(text || '').match(/(\d{1,2}(?:\.\d+)?)\s*(?:インチ|型)/i);
+  return m ? Number(m[1]) : 0;
+}
+
+function extractOperatingSystem(text) {
+  const m = String(text || '').match(/Windows\s*(?:10|11)(?:\s*(?:Pro|Home))?/i);
+  return m ? m[0] : '';
 }
 
 function normalizeListing(sku, data) {

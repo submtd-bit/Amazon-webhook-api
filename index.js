@@ -440,7 +440,7 @@ async function getLwaAccessToken() {
 }
 
 // -------------------- 共通：SP-API request --------------------
-async function spApiRequest({ method = "GET", path, body = null, accessToken }) {
+async function spApiRequest({ method = "GET", path, body = null, accessToken, timeoutMs = 0 }) {
   const bodyText = body ? JSON.stringify(body) : undefined;
 
   const headers = {
@@ -453,11 +453,25 @@ async function spApiRequest({ method = "GET", path, body = null, accessToken }) 
     headers["content-type"] = "application/json";
   }
 
-  const res = await fetch(`${SPAPI_ENDPOINT}${path}`, {
-    method,
-    headers,
-    body: bodyText
-  });
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  let res;
+  try {
+    res = await fetch(`${SPAPI_ENDPOINT}${path}`, {
+      method,
+      headers,
+      body: bodyText,
+      ...(controller ? { signal: controller.signal } : {})
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`SP-API request timeout after ${timeoutMs}ms: ${path}`);
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 
   const text = await res.text();
   const json = safeJsonParse(text);
@@ -510,9 +524,20 @@ const PRICE_ORDERS_MAX_RESULTS_PER_PAGE = 100;
 const PRICE_ORDERS_INCLUDED_DATA = [
   "FULFILLMENT",
   "PROCEEDS",
-  "PROMOTION",
   "CANCELLATION"
 ];
+const PRICE_ORDERS_REQUEST_TIMEOUT_MS = clampPriceOrdersInt(
+  process.env.PRICE_ORDERS_REQUEST_TIMEOUT_MS,
+  10000,
+  90000,
+  45000
+);
+const PRICE_ORDERS_ROUTE_TIMEOUT_MS = clampPriceOrdersInt(
+  process.env.PRICE_ORDERS_ROUTE_TIMEOUT_MS,
+  30000,
+  300000,
+  240000
+);
 
 function requirePriceOrderApiSecret(req, res, next) {
   // 価格自動設定GASは AMAZON_STOCK_API_SECRET を使っているため最優先。
@@ -689,30 +714,30 @@ function safePriceOrdersErrorMessage(err) {
 }
 
 async function searchPriceOrdersPage({
+  accessToken,
   createdAfter,
   paginationToken = "",
   maxResultsPerPage = PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
   includedData = PRICE_ORDERS_INCLUDED_DATA
 }) {
-  const query = {
-    createdAfter,
-    marketplaceIds: MARKETPLACE_ID,
-    maxResultsPerPage: String(maxResultsPerPage)
-  };
+  const query = new URLSearchParams();
+  query.set("createdAfter", createdAfter);
+  query.set("marketplaceIds", MARKETPLACE_ID);
+  query.set("maxResultsPerPage", String(maxResultsPerPage));
 
   if (includedData.length > 0) {
-    // decisionSpApiRequest は値をString化するため、OpenAPI配列をCSVで明示する。
-    query.includedData = includedData.join(",");
+    query.set("includedData", includedData.join(","));
   }
 
   if (paginationToken) {
-    query.paginationToken = paginationToken;
+    query.set("paginationToken", paginationToken);
   }
 
-  return decisionSpApiRequest({
+  return spApiRequest({
     method: "GET",
-    path: `/orders/${PRICE_ORDERS_API_VERSION}/orders`,
-    query
+    path: `/orders/${PRICE_ORDERS_API_VERSION}/orders?${query.toString()}`,
+    accessToken,
+    timeoutMs: PRICE_ORDERS_REQUEST_TIMEOUT_MS
   });
 }
 
@@ -727,10 +752,19 @@ app.get(
         Date.now() - 24 * 60 * 60 * 1000
       ).toISOString();
 
+      const startedAt = Date.now();
+      const accessToken = await getLwaAccessToken();
       await searchPriceOrdersPage({
+        accessToken,
         createdAfter,
         maxResultsPerPage: 1,
         includedData: []
+      });
+
+      console.log("✅ price orders capabilities OK", {
+        elapsedMs: Date.now() - startedAt,
+        apiVersion: PRICE_ORDERS_API_VERSION,
+        marketplaceId: MARKETPLACE_ID
       });
 
       return res.status(200).json({
@@ -741,6 +775,8 @@ app.get(
         maxLookbackDays: PRICE_ORDERS_MAX_LOOKBACK_DAYS,
         maxPages: PRICE_ORDERS_MAX_PAGES,
         maxResultsPerPage: PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
+        requestTimeoutMs: PRICE_ORDERS_REQUEST_TIMEOUT_MS,
+        routeTimeoutMs: PRICE_ORDERS_ROUTE_TIMEOUT_MS,
         privacyMode: "NO_BUYER_NO_RECIPIENT"
       });
     } catch (err) {
@@ -779,13 +815,44 @@ app.post(
         Date.now() - lookbackDays * 24 * 60 * 60 * 1000
       ).toISOString();
 
+      const startedAt = Date.now();
       const normalizedByKey = new Map();
       const orderIds = new Set();
       let paginationToken = "";
       let pages = 0;
 
+      console.log("🧾 price orders snapshot START", {
+        lookbackDays,
+        createdAfter,
+        maxPages,
+        maxResultsPerPage: PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
+        includedData: PRICE_ORDERS_INCLUDED_DATA,
+        requestTimeoutMs: PRICE_ORDERS_REQUEST_TIMEOUT_MS,
+        routeTimeoutMs: PRICE_ORDERS_ROUTE_TIMEOUT_MS
+      });
+
+      const accessToken = await getLwaAccessToken();
+      console.log("🔑 price orders LWA token acquired", {
+        elapsedMs: Date.now() - startedAt
+      });
+
       for (let page = 0; page < maxPages; page += 1) {
+        const elapsedBeforePage = Date.now() - startedAt;
+        if (elapsedBeforePage >= PRICE_ORDERS_ROUTE_TIMEOUT_MS) {
+          throw new Error(
+            `PRICE_ORDER_ROUTE_TIMEOUT before page ${page + 1}: elapsed=${elapsedBeforePage}ms`
+          );
+        }
+
+        const pageStartedAt = Date.now();
+        console.log("➡️ price orders page START", {
+          page: page + 1,
+          hasPaginationToken: Boolean(paginationToken),
+          elapsedMs: elapsedBeforePage
+        });
+
         const json = await searchPriceOrdersPage({
+          accessToken,
           createdAfter,
           paginationToken,
           maxResultsPerPage: PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
@@ -810,6 +877,17 @@ app.post(
         }
 
         paginationToken = extractPriceOrdersNextToken(json);
+
+        console.log("✅ price orders page DONE", {
+          page: page + 1,
+          orders: orders.length,
+          uniqueOrders: orderIds.size,
+          uniqueItems: normalizedByKey.size,
+          hasNextToken: Boolean(paginationToken),
+          pageElapsedMs: Date.now() - pageStartedAt,
+          totalElapsedMs: Date.now() - startedAt
+        });
+
         if (!paginationToken) break;
       }
 
@@ -818,6 +896,14 @@ app.post(
         const aTime = Date.parse(a.lastUpdatedTime || a.orderDate || "") || 0;
         const bTime = Date.parse(b.lastUpdatedTime || b.orderDate || "") || 0;
         return bTime - aTime;
+      });
+
+      console.log("✅ price orders snapshot DONE", {
+        pages,
+        partial,
+        orderCount: orderIds.size,
+        itemCount: items.length,
+        elapsedMs: Date.now() - startedAt
       });
 
       return res.status(200).json({
@@ -831,6 +917,7 @@ app.post(
         partial,
         orderCount: orderIds.size,
         count: items.length,
+        elapsedMs: Date.now() - startedAt,
         items
       });
     } catch (err) {
@@ -2061,7 +2148,7 @@ app.get("/version", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "amazon-webhook-api",
-    version: "2026-08-10-price-orders-v2026-v1"
+    version: "2026-08-12-price-orders-safety-v1.0.1"
   });
 });
 

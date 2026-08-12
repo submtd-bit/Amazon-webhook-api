@@ -627,16 +627,11 @@ function getPriceOrdersUnitPrice(item, quantityOrdered) {
 }
 
 function getPriceOrdersPromotionDiscount(item, unitPrice, quantityOrdered) {
-  // v2026ではプロモーション識別情報と金額情報の構造が分かれて返る場合があるため、
-  // 売価×数量とPROCEEDSのITEM小計との差額が正なら割引額として扱う。
-  if (unitPrice === null || quantityOrdered <= 0) return 0;
-
-  const subtotal = getPriceOrdersItemSubtotal(item);
-  if (subtotal.amount === null) return 0;
-
-  const gross = unitPrice * quantityOrdered;
-  const diff = gross - subtotal.amount;
-  return diff > 0 ? diff : 0;
+  // Orders API v2026-01-01 の PROMOTION は promotionId 等の識別情報が中心で、
+  // PROCEEDS の ITEM subtotal との差額をプロモーション割引額とみなすことはできない。
+  // JPではこの差額が消費税相当額になる実データを確認済みのため、推測値は返さない。
+  // 金額を正確に扱う実装を追加するまでは null（未取得）とする。
+  return null;
 }
 
 function hasExecutedPriceOrderCancellation(item) {
@@ -2148,7 +2143,7 @@ app.get("/version", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "amazon-webhook-api",
-    version: "2026-08-12-price-orders-safety-v1.0.1"
+    version: "2026-08-12-price-orders-safety-v1.0.2"
   });
 });
 

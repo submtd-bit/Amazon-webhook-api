@@ -496,6 +496,355 @@ async function decisionSpApiRequest({
     accessToken
   });
 }
+
+// -------------------- Price System: Orders API v2026-01-01 bridge --------------------
+// 価格自動設定GAS専用。BUYER / RECIPIENT は要求せず、個人情報を返さない。
+const PRICE_ORDERS_API_VERSION = "2026-01-01";
+const PRICE_ORDERS_DEFAULT_LOOKBACK_DAYS = 45;
+const PRICE_ORDERS_MAX_LOOKBACK_DAYS = Math.max(
+  1,
+  Number(process.env.PRICE_ORDERS_MAX_LOOKBACK_DAYS || 180)
+);
+const PRICE_ORDERS_MAX_PAGES = 20;
+const PRICE_ORDERS_MAX_RESULTS_PER_PAGE = 100;
+const PRICE_ORDERS_INCLUDED_DATA = [
+  "FULFILLMENT",
+  "PROCEEDS",
+  "PROMOTION",
+  "CANCELLATION"
+];
+
+function requirePriceOrderApiSecret(req, res, next) {
+  // 価格自動設定GASは AMAZON_STOCK_API_SECRET を使っているため最優先。
+  // 既存環境との互換性のため AMAZON_API_SECRET もフォールバックで許容する。
+  const expected =
+    process.env.AMAZON_STOCK_API_SECRET ||
+    process.env.AMAZON_API_SECRET ||
+    "";
+
+  if (!expected) {
+    return res.status(500).json({
+      ok: false,
+      error: "PRICE_ORDER_API_SECRET_NOT_CONFIGURED"
+    });
+  }
+
+  const actual = String(
+    req.headers["x-api-secret"] ||
+    req.headers["x-amazon-api-secret"] ||
+    ""
+  ).trim();
+
+  if (!actual || actual !== expected) {
+    console.warn("⚠️ Unauthorized price orders request:", {
+      method: req.method,
+      path: req.path
+    });
+
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized"
+    });
+  }
+
+  return next();
+}
+
+function clampPriceOrdersInt(value, min, max, fallback) {
+  let n = Number(value);
+  if (!Number.isFinite(n)) n = fallback;
+  n = Math.floor(n);
+  return Math.max(min, Math.min(max, n));
+}
+
+function priceOrdersAmount(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function priceOrdersMoney(money) {
+  if (!money || typeof money !== "object") {
+    return { amount: null, currency: "" };
+  }
+
+  return {
+    amount: priceOrdersAmount(money.amount ?? money.Amount),
+    currency: String(money.currencyCode || money.CurrencyCode || "")
+  };
+}
+
+function getPriceOrdersItemSubtotal(item) {
+  const breakdowns = Array.isArray(item?.proceeds?.breakdowns)
+    ? item.proceeds.breakdowns
+    : [];
+
+  const itemBreakdown = breakdowns.find(
+    (row) => String(row?.type || "").toUpperCase() === "ITEM"
+  );
+
+  return priceOrdersMoney(itemBreakdown?.subtotal);
+}
+
+function getPriceOrdersUnitPrice(item, quantityOrdered) {
+  const direct = priceOrdersMoney(item?.product?.price?.unitPrice);
+  if (direct.amount !== null) return direct;
+
+  const subtotal = getPriceOrdersItemSubtotal(item);
+  if (subtotal.amount !== null) {
+    return {
+      amount: quantityOrdered > 0 ? subtotal.amount / quantityOrdered : subtotal.amount,
+      currency: subtotal.currency
+    };
+  }
+
+  return { amount: null, currency: "JPY" };
+}
+
+function getPriceOrdersPromotionDiscount(item, unitPrice, quantityOrdered) {
+  // v2026ではプロモーション識別情報と金額情報の構造が分かれて返る場合があるため、
+  // 売価×数量とPROCEEDSのITEM小計との差額が正なら割引額として扱う。
+  if (unitPrice === null || quantityOrdered <= 0) return 0;
+
+  const subtotal = getPriceOrdersItemSubtotal(item);
+  if (subtotal.amount === null) return 0;
+
+  const gross = unitPrice * quantityOrdered;
+  const diff = gross - subtotal.amount;
+  return diff > 0 ? diff : 0;
+}
+
+function hasExecutedPriceOrderCancellation(item) {
+  const execution = item?.cancellation?.cancellationExecution;
+  return Boolean(execution && typeof execution === "object");
+}
+
+function normalizePriceOrderItem(order, item) {
+  const orderFulfillment = order?.fulfillment || {};
+  const itemFulfillment = item?.fulfillment || {};
+  const product = item?.product || {};
+
+  const quantityOrdered = Math.max(
+    0,
+    Number(item?.quantityOrdered || 0) || 0
+  );
+  const quantityFulfilled = Math.max(
+    0,
+    Number(itemFulfillment?.quantityFulfilled || 0) || 0
+  );
+
+  let fulfillmentStatus = String(
+    orderFulfillment?.fulfillmentStatus || ""
+  ).trim().toUpperCase();
+
+  // 一部キャンセル注文で注文全体がPARTIALLY_SHIPPEDでも、
+  // キャンセル確定した明細を販売数へ含めないよう明細単位でCANCELLEDにする。
+  if (hasExecutedPriceOrderCancellation(item)) {
+    fulfillmentStatus = "CANCELLED";
+  }
+
+  const unitPriceMoney = getPriceOrdersUnitPrice(item, quantityOrdered);
+  const promotionDiscount = getPriceOrdersPromotionDiscount(
+    item,
+    unitPriceMoney.amount,
+    quantityOrdered
+  );
+
+  return {
+    orderId: String(order?.orderId || "").trim(),
+    orderDate: order?.createdTime || "",
+    lastUpdatedTime: order?.lastUpdatedTime || "",
+    fulfillmentStatus,
+    fulfilledBy: String(orderFulfillment?.fulfilledBy || "").trim().toUpperCase(),
+    orderItemId: String(item?.orderItemId || "").trim(),
+    sellerSku: String(product?.sellerSku || "").trim(),
+    asin: String(product?.asin || "").trim(),
+    title: String(product?.title || "").trim(),
+    quantityOrdered,
+    quantityFulfilled,
+    unitPrice: unitPriceMoney.amount,
+    currency: unitPriceMoney.currency || "JPY",
+    promotionDiscount
+  };
+}
+
+function extractPriceOrdersOrders(json) {
+  if (Array.isArray(json?.orders)) return json.orders;
+  if (Array.isArray(json?.payload?.orders)) return json.payload.orders;
+  return [];
+}
+
+function extractPriceOrdersNextToken(json) {
+  return String(
+    json?.pagination?.nextToken ||
+    json?.payload?.pagination?.nextToken ||
+    ""
+  ).trim();
+}
+
+function safePriceOrdersErrorMessage(err) {
+  return String(err?.message || err || "Unknown error")
+    .replace(/Atza\|[^\s"']+/g, "[REDACTED_TOKEN]")
+    .slice(0, 1800);
+}
+
+async function searchPriceOrdersPage({
+  createdAfter,
+  paginationToken = "",
+  maxResultsPerPage = PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
+  includedData = PRICE_ORDERS_INCLUDED_DATA
+}) {
+  const query = {
+    createdAfter,
+    marketplaceIds: MARKETPLACE_ID,
+    maxResultsPerPage: String(maxResultsPerPage)
+  };
+
+  if (includedData.length > 0) {
+    // decisionSpApiRequest は値をString化するため、OpenAPI配列をCSVで明示する。
+    query.includedData = includedData.join(",");
+  }
+
+  if (paginationToken) {
+    query.paginationToken = paginationToken;
+  }
+
+  return decisionSpApiRequest({
+    method: "GET",
+    path: `/orders/${PRICE_ORDERS_API_VERSION}/orders`,
+    query
+  });
+}
+
+app.get(
+  "/price/orders/capabilities",
+  requirePriceOrderApiSecret,
+  async (req, res) => {
+    try {
+      // 認証・権限・v2026ルートまで確認するため、直近1日の基本情報を1件だけ読む。
+      // BUYER / RECIPIENT は要求しない。
+      const createdAfter = new Date(
+        Date.now() - 24 * 60 * 60 * 1000
+      ).toISOString();
+
+      await searchPriceOrdersPage({
+        createdAfter,
+        maxResultsPerPage: 1,
+        includedData: []
+      });
+
+      return res.status(200).json({
+        ok: true,
+        service: "price-orders-bridge",
+        ordersApiVersion: PRICE_ORDERS_API_VERSION,
+        marketplaceId: MARKETPLACE_ID,
+        maxLookbackDays: PRICE_ORDERS_MAX_LOOKBACK_DAYS,
+        maxPages: PRICE_ORDERS_MAX_PAGES,
+        maxResultsPerPage: PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
+        privacyMode: "NO_BUYER_NO_RECIPIENT"
+      });
+    } catch (err) {
+      safeLogError("❌ Error in /price/orders/capabilities:", err);
+      return res.status(502).json({
+        ok: false,
+        error: "PRICE_ORDER_CAPABILITIES_FAILED",
+        message: safePriceOrdersErrorMessage(err)
+      });
+    }
+  }
+);
+
+app.post(
+  "/price/orders/snapshot",
+  requirePriceOrderApiSecret,
+  async (req, res) => {
+    try {
+      const payload = req.body || {};
+      const lookbackDays = clampPriceOrdersInt(
+        payload.lookbackDays,
+        1,
+        PRICE_ORDERS_MAX_LOOKBACK_DAYS,
+        PRICE_ORDERS_DEFAULT_LOOKBACK_DAYS
+      );
+      const maxPages = clampPriceOrdersInt(
+        payload.maxPages,
+        1,
+        PRICE_ORDERS_MAX_PAGES,
+        PRICE_ORDERS_MAX_PAGES
+      );
+
+      // 価格システムは「直近N日分を毎回スナップショット再取得」するためcreatedAfterを使用。
+      // これによりキャンセル・出荷状態も現在値で再評価できる。
+      const createdAfter = new Date(
+        Date.now() - lookbackDays * 24 * 60 * 60 * 1000
+      ).toISOString();
+
+      const normalizedByKey = new Map();
+      const orderIds = new Set();
+      let paginationToken = "";
+      let pages = 0;
+
+      for (let page = 0; page < maxPages; page += 1) {
+        const json = await searchPriceOrdersPage({
+          createdAfter,
+          paginationToken,
+          maxResultsPerPage: PRICE_ORDERS_MAX_RESULTS_PER_PAGE,
+          includedData: PRICE_ORDERS_INCLUDED_DATA
+        });
+
+        pages += 1;
+
+        const orders = extractPriceOrdersOrders(json);
+        for (const order of orders) {
+          const orderId = String(order?.orderId || "").trim();
+          if (orderId) orderIds.add(orderId);
+
+          const items = Array.isArray(order?.orderItems) ? order.orderItems : [];
+          for (const item of items) {
+            const normalized = normalizePriceOrderItem(order, item);
+            if (!normalized.orderId || !normalized.orderItemId) continue;
+
+            const key = `${normalized.orderId}|${normalized.orderItemId}`;
+            normalizedByKey.set(key, normalized);
+          }
+        }
+
+        paginationToken = extractPriceOrdersNextToken(json);
+        if (!paginationToken) break;
+      }
+
+      const partial = Boolean(paginationToken);
+      const items = Array.from(normalizedByKey.values()).sort((a, b) => {
+        const aTime = Date.parse(a.lastUpdatedTime || a.orderDate || "") || 0;
+        const bTime = Date.parse(b.lastUpdatedTime || b.orderDate || "") || 0;
+        return bTime - aTime;
+      });
+
+      return res.status(200).json({
+        ok: true,
+        service: "price-orders-bridge",
+        ordersApiVersion: PRICE_ORDERS_API_VERSION,
+        marketplaceId: MARKETPLACE_ID,
+        lookbackDays,
+        createdAfter,
+        pages,
+        partial,
+        orderCount: orderIds.size,
+        count: items.length,
+        items
+      });
+    } catch (err) {
+      safeLogError("❌ Error in /price/orders/snapshot:", err);
+      return res.status(502).json({
+        ok: false,
+        error: "PRICE_ORDER_SNAPSHOT_FAILED",
+        message: safePriceOrdersErrorMessage(err)
+      });
+    }
+  }
+);
+
+
 async function updateAmazonListingQuantity({ sku, quantity }) {
   if (!SELLER_ID) {
     throw new Error("Missing env: SPAPI_SELLER_ID");
@@ -1712,7 +2061,7 @@ app.get("/version", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "amazon-webhook-api",
-    version: "2026-05-11-orders-address-v6"
+    version: "2026-08-10-price-orders-v2026-v1"
   });
 });
 

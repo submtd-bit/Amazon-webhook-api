@@ -39,6 +39,7 @@ function buildInventoryPatch(payload) {
   const quantity = Number(payload.quantity);
   const reservation = payload.reservation === true;
   const clearReservationMetadata = payload.clearReservationMetadata === true;
+  const dryRun = payload.dryRun === true;
   const leadDays = Number(payload.leadTimeBusinessDays || 0);
   const restockDate = String(payload.restockDate || "").trim();
 
@@ -63,7 +64,10 @@ function buildInventoryPatch(payload) {
     availability.restock_date = restockDate;
   }
 
-  const operation = (reservation || clearReservationMetadata) ? "replace" : "merge";
+  // Amazon VALIDATION_PREVIEW does not accept merge operations.
+  // For DRY RUN only, validate the same quantity payload with replace.
+  // LIVE quantity-only updates still use merge so reservation metadata is preserved.
+  const operation = (reservation || clearReservationMetadata || dryRun) ? "replace" : "merge";
   return { sku, quantity, reservation, clearReservationMetadata, operation, availability };
 }
 

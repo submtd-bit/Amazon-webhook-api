@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node --import ./reservation_stock_preload.mjs index.js"
+    "start": "node --import ./reservation_stock_preload.mjs --import ./g83_sale_preload.mjs index.js"
   },
   "dependencies": {
     "express": "^4.19.2",

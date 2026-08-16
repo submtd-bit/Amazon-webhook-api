@@ -1,0 +1,100 @@
+MTD株式会社 / amazon-webhook-api
+Amazon予約販売メタデータ対応パッチ v1.0.3
+対象: GitHub submtd-bit/Amazon-webhook-api の現行 index.js（2026-08-12-price-orders-safety-v1.0.2）
+作成日: 2026-08-14
+
+目的
+- /amazon/stock/update が quantity だけでなく reservation / leadTimeBusinessDays / restockDate を受ける
+- Amazon Listings Items API fulfillment_availability に以下を反映する
+  - quantity
+  - lead_time_to_ship_max_days（再入荷後の処理時間。3営業日の再入荷リードとは別）
+  - restock_date（3営業日後の再入荷・発送可能日）
+- dryRun=true ではSP-APIを書き換えず、実際に送る予定のavailabilityを返す
+- reservation=false の本番送信は従来どおりquantity-only replaceに戻し、予約メタデータ解除に利用する
+
+重要
+Amazon公式仕様では restock_date はMFN在庫が発送可能になる日、lead_time_to_ship_max_days は処理時間。
+「3営業日後に再入荷・発送可能」の3日を両方に設定すると納期を二重加算する恐れがあるため、MTD運用では以下に分離する。
+- RESTOCK_BUSINESS_DAYS = 3 → restockDate算出
+- AMAZON_POST_RESTOCK_HANDLING_DAYS = 1 → leadTimeBusinessDays
+
+1. updateAmazonListingQuantity を以下へ置換
+
+async function updateAmazonListingQuantity({
+  sku,
+  quantity,
+  reservation = false,
+  leadTimeBusinessDays = 0,
+  restockDate = ""
+}) {
+  if (!SELLER_ID) throw new Error("Missing env: SPAPI_SELLER_ID");
+  if (!sku) throw new Error("sku is required");
+
+  const qty = Number(quantity);
+  if (!Number.isFinite(qty) || qty < 0) {
+    throw new Error("quantity must be a non-negative number");
+  }
+
+  const availability = {
+    fulfillment_channel_code: "DEFAULT",
+    quantity: qty
+  };
+
+  if (reservation === true) {
+    const leadDays = Number(leadTimeBusinessDays);
+    const dateText = String(restockDate || "").trim();
+    if (!Number.isInteger(leadDays) || leadDays < 1 || leadDays > 30) {
+      throw new Error("leadTimeBusinessDays must be an integer between 1 and 30 for reservation stock");
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText) || Number.isNaN(Date.parse(dateText + "T00:00:00Z"))) {
+      throw new Error("restockDate must be YYYY-MM-DD for reservation stock");
+    }
+    availability.lead_time_to_ship_max_days = leadDays;
+    availability.restock_date = dateText;
+  }
+
+  const accessToken = await getLwaAccessToken();
+  const body = {
+    productType: "PRODUCT",
+    patches: [{
+      op: "replace",
+      path: "/attributes/fulfillment_availability",
+      value: [availability]
+    }]
+  };
+
+  const result = await spApiRequest({
+    method: "PATCH",
+    path: `/listings/2021-08-01/items/${encodeURIComponent(SELLER_ID)}/${encodeURIComponent(sku)}` +
+      `?marketplaceIds=${encodeURIComponent(MARKETPLACE_ID)}`,
+    body,
+    accessToken
+  });
+
+  return { amazon: result, submittedAvailability: availability };
+}
+
+2. POST /amazon/stock/update は req.body から以下を受け取る
+- sku
+- quantity
+- dryRun
+- reservation
+- leadTimeBusinessDays
+- restockDate
+
+reservation=true の場合は leadTimeBusinessDays=1 と restockDate=YYYY-MM-DD を検証し、dryRunではavailabilityPreviewを返す。本番では updateAmazonListingQuantity へ全項目を渡す。
+
+3. /version を変更
+現行: 2026-08-12-price-orders-safety-v1.0.2
+変更後: 2026-08-14-reservation-metadata-v1.0.3
+
+安全手順
+1. Render側を先にv1.0.3対応
+2. /version確認
+3. 02FのAMAZON_RESERVATION_METADATA_ENABLEDはFALSEのまま
+4. GASをv3.4.1へ更新
+5. 02FをTRUEへ変更
+6. 03を再集計（数量差分0でもE7をメタデータ送信候補にする）
+7. Amazon DRY RUNで Q75 / restockDate=2026-08-19 / handling=1 を確認
+8. 本番一括
+9. Seller Centralで再入荷日・処理時間を確認

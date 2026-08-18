@@ -1,10 +1,10 @@
 {
   "name": "amazon-webhook-api",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node --import ./reservation_stock_preload.mjs --import ./g83_sale_preload.mjs --import ./g83_sale_route_bootstrap.mjs --import ./g83_emergency_price_preload.mjs --import ./g83_emergency_price_route_bootstrap.mjs --import ./g83_b2b_price_preload.mjs --import ./g83_b2b_price_route_bootstrap.mjs --import ./g83_b2b_quantity_preload.mjs --import ./g83_b2b_quantity_route_bootstrap.mjs index.js"
+    "start": "node --import ./reservation_stock_preload.mjs --import ./g83_sale_preload.mjs --import ./g83_sale_route_bootstrap.mjs --import ./g83_emergency_price_preload.mjs --import ./g83_emergency_price_route_bootstrap.mjs --import ./g83_b2b_price_preload.mjs --import ./g83_b2b_price_route_bootstrap.mjs --import ./g83_b2b_quantity_percent_preload.mjs --import ./g83_b2b_quantity_route_bootstrap.mjs index.js"
   },
   "dependencies": {
     "express": "^4.19.2",

@@ -2,14 +2,19 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-22-amazon-listing-issue-repair-v1.0.0";
+const MODULE_VERSION = "2026-08-22-amazon-listing-issue-repair-v1.1.0";
 const ROUTE = "/amazon/listing/issue-repair";
 const REQUEST_TIMEOUT_MS = 20000;
+const PREVIEW_RETRY_GAP_MS = 1100;
 const originalListen = express.application.listen;
 
 function safeJsonParse(text) {
   if (!text) return {};
   try { return JSON.parse(text); } catch { return { rawText: text }; }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getSecret() {
@@ -91,9 +96,8 @@ function getCurrentError(listing, code, attributeName) {
 }
 
 function cloneAttributeWithReplacement(currentValues, replacementValue) {
-  if (!Array.isArray(currentValues) || currentValues.length === 0) {
-    throw new Error("title_differentiation current attribute is missing");
-  }
+  if (!Array.isArray(currentValues) || currentValues.length === 0) return null;
+
   return currentValues.map((entry, index) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`title_differentiation[${index}] has unexpected structure`);
@@ -103,7 +107,9 @@ function cloneAttributeWithReplacement(currentValues, replacementValue) {
       copy.value = replacementValue;
       return copy;
     }
-    const stringKeys = Object.keys(copy).filter(key => typeof copy[key] === "string" && key !== "marketplace_id" && key !== "language_tag");
+    const stringKeys = Object.keys(copy).filter(
+      key => typeof copy[key] === "string" && key !== "marketplace_id" && key !== "language_tag"
+    );
     if (stringKeys.length === 1) {
       copy[stringKeys[0]] = replacementValue;
       return copy;
@@ -112,9 +118,67 @@ function cloneAttributeWithReplacement(currentValues, replacementValue) {
   });
 }
 
-async function patchTitleDifferentiation(accessToken, sku, productType, value, dryRun) {
+function buildPreviewCandidates(currentValues, replacementValue, marketplaceId) {
+  const candidates = [];
+  const cloned = cloneAttributeWithReplacement(currentValues, replacementValue);
+  if (cloned) {
+    candidates.push({ strategy: "clone_current", op: "replace", value: cloned });
+  }
+
+  // GET Listings Items can report an issue for an attribute without returning that
+  // attribute in the seller contribution. In that case, VALIDATION_PREVIEW is used
+  // to safely discover the accepted top-level attribute shape without persisting data.
+  candidates.push(
+    {
+      strategy: "add_value_marketplace_language",
+      op: "add",
+      value: [{ value: replacementValue, marketplace_id: marketplaceId, language_tag: "ja_JP" }],
+    },
+    {
+      strategy: "add_value_marketplace",
+      op: "add",
+      value: [{ value: replacementValue, marketplace_id: marketplaceId }],
+    },
+    {
+      strategy: "add_value_language",
+      op: "add",
+      value: [{ value: replacementValue, language_tag: "ja_JP" }],
+    },
+    {
+      strategy: "add_value_only",
+      op: "add",
+      value: [{ value: replacementValue }],
+    },
+  );
+
+  const seen = new Set();
+  return candidates.filter(candidate => {
+    const key = JSON.stringify({ op: candidate.op, value: candidate.value });
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function summarizePatchResponse(json) {
+  const issues = Array.isArray(json?.issues) ? json.issues : [];
+  const errorIssues = issues.filter(issue => String(issue?.severity || "").toUpperCase() === "ERROR");
+  const status = String(json?.status || "").toUpperCase();
+  return {
+    status,
+    issues,
+    errorCount: errorIssues.length,
+    valid: errorIssues.length === 0 && (status === "VALID" || status === "ACCEPTED"),
+  };
+}
+
+async function patchTitleDifferentiation(accessToken, sku, productType, candidate, dryRun) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
-  const query = new URLSearchParams({ marketplaceIds: marketplaceId, issueLocale: "ja_JP" });
+  const query = new URLSearchParams({
+    marketplaceIds: marketplaceId,
+    issueLocale: "ja_JP",
+    includedData: "issues",
+  });
   if (dryRun) query.set("mode", "VALIDATION_PREVIEW");
 
   const url = `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(sku)}?${query}`;
@@ -128,18 +192,53 @@ async function patchTitleDifferentiation(accessToken, sku, productType, value, d
     body: JSON.stringify({
       productType,
       patches: [{
-        op: "replace",
+        op: candidate.op,
         path: "/attributes/title_differentiation",
-        value,
+        value: candidate.value,
       }],
     }),
   });
 
   const json = safeJsonParse(await response.text());
-  if (!response.ok) {
-    throw new Error(`SP-API PATCH error: ${response.status} ${JSON.stringify(json)}`);
+  return {
+    httpStatus: response.status,
+    responseOk: response.ok,
+    json,
+    ...summarizePatchResponse(json),
+  };
+}
+
+async function runValidationPreview(accessToken, sku, productType, currentValues, replacementValue) {
+  const { marketplaceId } = getConfig();
+  const candidates = buildPreviewCandidates(currentValues, replacementValue, marketplaceId);
+  const attempts = [];
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    const result = await patchTitleDifferentiation(accessToken, sku, productType, candidate, true);
+    attempts.push({
+      strategy: candidate.strategy,
+      op: candidate.op,
+      value: candidate.value,
+      httpStatus: result.httpStatus,
+      responseOk: result.responseOk,
+      status: result.status,
+      errorCount: result.errorCount,
+      issues: result.issues,
+    });
+
+    if (result.responseOk && result.valid) {
+      return { selected: candidate, patchResult: result, attempts };
+    }
+
+    if (i < candidates.length - 1) await sleep(PREVIEW_RETRY_GAP_MS);
   }
-  return { httpStatus: response.status, json };
+
+  return {
+    selected: null,
+    patchResult: attempts.length ? { json: { status: attempts[attempts.length - 1].status, issues: attempts[attempts.length - 1].issues } } : { json: {} },
+    attempts,
+  };
 }
 
 async function handler(req, res) {
@@ -172,8 +271,26 @@ async function handler(req, res) {
     if (!productType) throw new Error("Listing productType could not be resolved");
 
     const currentValues = listing?.attributes?.title_differentiation;
-    const patchedValues = cloneAttributeWithReplacement(currentValues, replacementValue);
-    const patch = await patchTitleDifferentiation(accessToken, sku, productType, patchedValues, dryRun);
+    const currentAttributePresent = Array.isArray(currentValues) && currentValues.length > 0;
+    const currentValue = currentAttributePresent && currentValues[0] && typeof currentValues[0] === "object"
+      ? String(currentValues[0].value || "")
+      : "";
+    const currentLength = currentAttributePresent ? [...currentValue].length : null;
+
+    if (!dryRun) {
+      throw new Error("LIVE_REPAIR_BLOCKED: v1.1.0 requires a successful VALIDATION_PREVIEW before live repair is enabled");
+    }
+
+    const preview = await runValidationPreview(
+      accessToken,
+      sku,
+      productType,
+      currentValues,
+      replacementValue,
+    );
+
+    const selected = preview.selected;
+    const patchResponse = preview.patchResult?.json || {};
 
     return res.status(200).json({
       ok: true,
@@ -182,18 +299,20 @@ async function handler(req, res) {
       sku,
       issueCode,
       attributeName,
-      dryRun,
+      dryRun: true,
       productType,
+      currentAttributePresent,
+      currentValue,
+      currentLength,
       replacementValue,
       replacementLength: [...replacementValue].length,
-      currentValue: Array.isArray(currentValues) && currentValues[0] && typeof currentValues[0] === "object"
-        ? String(currentValues[0].value || "")
-        : "",
-      currentLength: Array.isArray(currentValues) && currentValues[0] && typeof currentValues[0] === "object"
-        ? [...String(currentValues[0].value || "")].length
-        : null,
-      patchResponse: patch.json,
-      externalChanges: dryRun ? 0 : 1,
+      validationPassed: Boolean(selected),
+      selectedStrategy: selected ? selected.strategy : "",
+      selectedOp: selected ? selected.op : "",
+      selectedValue: selected ? selected.value : null,
+      attempts: preview.attempts,
+      patchResponse,
+      externalChanges: 0,
     });
   } catch (err) {
     console.error("Amazon listing issue repair error", err?.message || String(err));

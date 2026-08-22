@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-21-amazon-inventory-fresh-get-v1.0.0";
+const MODULE_VERSION = "2026-08-22-amazon-inventory-fresh-get-v1.1.0";
 const ROUTE = "/amazon/stock/fresh-get";
 const MAX_SKUS = 50;
 const REQUEST_TIMEOUT_MS = 20000;
@@ -121,6 +121,30 @@ async function getListing(accessToken, sku) {
   return amazonGet(url, accessToken);
 }
 
+function normalizeIssueDetail(issue) {
+  const attributeNames = Array.isArray(issue?.attributeNames)
+    ? issue.attributeNames.map(value => String(value || "").trim()).filter(Boolean).slice(0, 20)
+    : [];
+  const categories = Array.isArray(issue?.categories)
+    ? issue.categories.map(value => String(value || "").trim()).filter(Boolean).slice(0, 20)
+    : [];
+  const enforcements = Array.isArray(issue?.enforcements)
+    ? issue.enforcements.slice(0, 20).map(value => ({
+        action: String(value?.action || ""),
+        exemption: value?.exemption && typeof value.exemption === "object" ? value.exemption : null,
+      }))
+    : [];
+
+  return {
+    code: String(issue?.code || ""),
+    severity: String(issue?.severity || ""),
+    message: String(issue?.message || ""),
+    attributeNames,
+    categories,
+    enforcements,
+  };
+}
+
 function analyzeListing(listing) {
   const summary = Array.isArray(listing?.summaries) ? listing.summaries[0] || {} : {};
   const statuses = Array.isArray(summary?.status) ? summary.status.map(String) : [];
@@ -141,6 +165,7 @@ function analyzeListing(listing) {
     availableQuantity: quantity,
     errorCount: errorIssues.length,
     issueCodes: errorIssues.map(row => String(row?.code || "")).filter(Boolean).slice(0, 10),
+    issueDetails: errorIssues.map(normalizeIssueDetail).slice(0, 10),
   };
 }
 

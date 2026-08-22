@@ -1,10 +1,10 @@
 {
   "name": "amazon-webhook-api",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node --import ./reservation_stock_preload.mjs --import ./g83_sale_preload.mjs --import ./g83_sale_route_bootstrap.mjs --import ./g83_emergency_price_preload.mjs --import ./g83_emergency_price_route_bootstrap.mjs --import ./g83_b2b_price_preload.mjs --import ./g83_b2b_price_route_bootstrap.mjs --import ./g83_b2b_quantity_percent_preload.mjs --import ./g83_b2b_quantity_route_bootstrap.mjs --import ./b2b_fresh_get_preload.mjs --import ./b2b_quantity_remove_dryrun_preload.mjs --import ./b2b_quantity_remove_merge_dryrun_preload.mjs --import ./b2b_quantity_remove_merge_preflight_preload.mjs --import ./b2b_quantity_remove_merge_live_preload.mjs --import ./b2b_quantity_remove_live_preload.mjs --import ./amazon_inventory_fresh_get_preload.mjs --import ./amazon_listing_issue_repair_preload.mjs --import ./amazon_listing_issue_inspect_preload.mjs index.js"
+    "start": "node --import ./reservation_stock_preload.mjs --import ./g83_sale_preload.mjs --import ./g83_sale_route_bootstrap.mjs --import ./g83_emergency_price_preload.mjs --import ./g83_emergency_price_route_bootstrap.mjs --import ./g83_b2b_price_preload.mjs --import ./g83_b2b_price_route_bootstrap.mjs --import ./g83_b2b_quantity_percent_preload.mjs --import ./g83_b2b_quantity_route_bootstrap.mjs --import ./b2b_fresh_get_preload.mjs --import ./b2b_quantity_remove_dryrun_preload.mjs --import ./b2b_quantity_remove_merge_dryrun_preload.mjs --import ./b2b_quantity_remove_merge_preflight_preload.mjs --import ./b2b_quantity_remove_merge_batch_preflight_preload.mjs --import ./b2b_quantity_remove_merge_live_preload.mjs --import ./b2b_quantity_remove_live_preload.mjs --import ./amazon_inventory_fresh_get_preload.mjs --import ./amazon_listing_issue_repair_preload.mjs --import ./amazon_listing_issue_inspect_preload.mjs index.js"
   },
   "dependencies": {
     "express": "^4.19.2",

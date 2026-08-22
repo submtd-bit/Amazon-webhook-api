@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-22-amazon-listing-issue-repair-v1.1.0";
+const MODULE_VERSION = "2026-08-22-amazon-listing-issue-repair-v1.2.0";
 const ROUTE = "/amazon/listing/issue-repair";
 const REQUEST_TIMEOUT_MS = 20000;
 const PREVIEW_RETRY_GAP_MS = 1100;
@@ -95,12 +95,21 @@ function getCurrentError(listing, code, attributeName) {
   }) || null;
 }
 
-function cloneAttributeWithReplacement(currentValues, replacementValue) {
+function extractFirstValue(values) {
+  if (!Array.isArray(values) || !values.length || !values[0] || typeof values[0] !== "object") return "";
+  if (Object.prototype.hasOwnProperty.call(values[0], "value")) return String(values[0].value || "");
+  const keys = Object.keys(values[0]).filter(
+    key => typeof values[0][key] === "string" && key !== "marketplace_id" && key !== "language_tag"
+  );
+  return keys.length === 1 ? String(values[0][keys[0]] || "") : "";
+}
+
+function cloneAttributeWithReplacement(currentValues, replacementValue, attributeName) {
   if (!Array.isArray(currentValues) || currentValues.length === 0) return null;
 
   return currentValues.map((entry, index) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`title_differentiation[${index}] has unexpected structure`);
+      throw new Error(`${attributeName}[${index}] has unexpected structure`);
     }
     const copy = { ...entry };
     if (Object.prototype.hasOwnProperty.call(copy, "value")) {
@@ -114,50 +123,38 @@ function cloneAttributeWithReplacement(currentValues, replacementValue) {
       copy[stringKeys[0]] = replacementValue;
       return copy;
     }
-    throw new Error(`title_differentiation[${index}] has no replaceable value field`);
+    throw new Error(`${attributeName}[${index}] has no replaceable value field`);
   });
 }
 
-function buildPreviewCandidates(currentValues, replacementValue, marketplaceId) {
-  const candidates = [];
-  const cloned = cloneAttributeWithReplacement(currentValues, replacementValue);
+function buildAttributeCandidates(attributeName, currentValues, replacementValue, marketplaceId) {
+  const cloned = cloneAttributeWithReplacement(currentValues, replacementValue, attributeName);
   if (cloned) {
-    candidates.push({ strategy: "clone_current", op: "replace", value: cloned });
+    return [{ strategy: `${attributeName}_clone_current`, op: "replace", value: cloned }];
   }
 
-  // GET Listings Items can report an issue for an attribute without returning that
-  // attribute in the seller contribution. In that case, VALIDATION_PREVIEW is used
-  // to safely discover the accepted top-level attribute shape without persisting data.
-  candidates.push(
+  return [
     {
-      strategy: "add_value_marketplace_language",
+      strategy: `${attributeName}_add_value_marketplace_language`,
       op: "add",
       value: [{ value: replacementValue, marketplace_id: marketplaceId, language_tag: "ja_JP" }],
     },
     {
-      strategy: "add_value_marketplace",
+      strategy: `${attributeName}_add_value_marketplace`,
       op: "add",
       value: [{ value: replacementValue, marketplace_id: marketplaceId }],
     },
     {
-      strategy: "add_value_language",
+      strategy: `${attributeName}_add_value_language`,
       op: "add",
       value: [{ value: replacementValue, language_tag: "ja_JP" }],
     },
     {
-      strategy: "add_value_only",
+      strategy: `${attributeName}_add_value_only`,
       op: "add",
       value: [{ value: replacementValue }],
     },
-  );
-
-  const seen = new Set();
-  return candidates.filter(candidate => {
-    const key = JSON.stringify({ op: candidate.op, value: candidate.value });
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  ];
 }
 
 function summarizePatchResponse(json) {
@@ -172,14 +169,28 @@ function summarizePatchResponse(json) {
   };
 }
 
-async function patchTitleDifferentiation(accessToken, sku, productType, candidate, dryRun) {
+async function patchListingPreview(accessToken, sku, productType, titleCandidate, highlightCandidate) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
   const query = new URLSearchParams({
     marketplaceIds: marketplaceId,
     issueLocale: "ja_JP",
     includedData: "issues",
+    mode: "VALIDATION_PREVIEW",
   });
-  if (dryRun) query.set("mode", "VALIDATION_PREVIEW");
+
+  const patches = [];
+  if (titleCandidate) {
+    patches.push({
+      op: titleCandidate.op,
+      path: "/attributes/item_name",
+      value: titleCandidate.value,
+    });
+  }
+  patches.push({
+    op: highlightCandidate.op,
+    path: "/attributes/title_differentiation",
+    value: highlightCandidate.value,
+  });
 
   const url = `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(sku)}?${query}`;
   const response = await fetchWithTimeout(url, {
@@ -189,14 +200,7 @@ async function patchTitleDifferentiation(accessToken, sku, productType, candidat
       "content-type": "application/json",
       accept: "application/json",
     },
-    body: JSON.stringify({
-      productType,
-      patches: [{
-        op: candidate.op,
-        path: "/attributes/title_differentiation",
-        value: candidate.value,
-      }],
-    }),
+    body: JSON.stringify({ productType, patches }),
   });
 
   const json = safeJsonParse(await response.text());
@@ -208,35 +212,42 @@ async function patchTitleDifferentiation(accessToken, sku, productType, candidat
   };
 }
 
-async function runValidationPreview(accessToken, sku, productType, currentValues, replacementValue) {
+async function runValidationPreview(accessToken, sku, productType, listing, replacementTitle, replacementHighlight) {
   const { marketplaceId } = getConfig();
-  const candidates = buildPreviewCandidates(currentValues, replacementValue, marketplaceId);
+  const currentTitleValues = listing?.attributes?.item_name;
+  const currentHighlightValues = listing?.attributes?.title_differentiation;
+  const titleCandidates = buildAttributeCandidates("item_name", currentTitleValues, replacementTitle, marketplaceId);
+  const highlightCandidates = buildAttributeCandidates("title_differentiation", currentHighlightValues, replacementHighlight, marketplaceId);
   const attempts = [];
 
-  for (let i = 0; i < candidates.length; i += 1) {
-    const candidate = candidates[i];
-    const result = await patchTitleDifferentiation(accessToken, sku, productType, candidate, true);
-    attempts.push({
-      strategy: candidate.strategy,
-      op: candidate.op,
-      value: candidate.value,
-      httpStatus: result.httpStatus,
-      responseOk: result.responseOk,
-      status: result.status,
-      errorCount: result.errorCount,
-      issues: result.issues,
-    });
+  for (const titleCandidate of titleCandidates) {
+    for (const highlightCandidate of highlightCandidates) {
+      const result = await patchListingPreview(accessToken, sku, productType, titleCandidate, highlightCandidate);
+      attempts.push({
+        titleStrategy: titleCandidate.strategy,
+        titleOp: titleCandidate.op,
+        highlightStrategy: highlightCandidate.strategy,
+        highlightOp: highlightCandidate.op,
+        httpStatus: result.httpStatus,
+        responseOk: result.responseOk,
+        status: result.status,
+        errorCount: result.errorCount,
+        issues: result.issues,
+      });
 
-    if (result.responseOk && result.valid) {
-      return { selected: candidate, patchResult: result, attempts };
+      if (result.responseOk && result.valid) {
+        return { selectedTitle: titleCandidate, selectedHighlight: highlightCandidate, patchResult: result, attempts };
+      }
+
+      await sleep(PREVIEW_RETRY_GAP_MS);
     }
-
-    if (i < candidates.length - 1) await sleep(PREVIEW_RETRY_GAP_MS);
   }
 
+  const last = attempts[attempts.length - 1] || {};
   return {
-    selected: null,
-    patchResult: attempts.length ? { json: { status: attempts[attempts.length - 1].status, issues: attempts[attempts.length - 1].issues } } : { json: {} },
+    selectedTitle: null,
+    selectedHighlight: null,
+    patchResult: { json: { status: last.status || "", issues: last.issues || [] } },
     attempts,
   };
 }
@@ -253,12 +264,15 @@ async function handler(req, res) {
     const issueCode = String(req.body?.issueCode || "").trim();
     const attributeName = String(req.body?.attributeName || "").trim();
     const replacementValue = String(req.body?.replacementValue || "").trim();
+    const replacementTitle = String(req.body?.replacementTitle || "").trim();
     const dryRun = req.body?.dryRun !== false;
 
     if (!sku) throw new Error("sku is required");
     if (issueCode !== "90225") throw new Error("Only issueCode 90225 is supported by this guarded route");
     if (attributeName !== "title_differentiation") throw new Error("Only title_differentiation is supported by this guarded route");
+    if (!replacementTitle) throw new Error("replacementTitle is required for the 2026 title/highlight format preview");
     if (!replacementValue) throw new Error("replacementValue is required");
+    if ([...replacementTitle].length > 75) throw new Error("replacementTitle must be <= 75 characters");
     if ([...replacementValue].length > 125) throw new Error("replacementValue must be <= 125 characters");
 
     const accessToken = await getLwaAccessToken();
@@ -270,26 +284,26 @@ async function handler(req, res) {
     const productType = String(summary?.productType || "").trim();
     if (!productType) throw new Error("Listing productType could not be resolved");
 
-    const currentValues = listing?.attributes?.title_differentiation;
-    const currentAttributePresent = Array.isArray(currentValues) && currentValues.length > 0;
-    const currentValue = currentAttributePresent && currentValues[0] && typeof currentValues[0] === "object"
-      ? String(currentValues[0].value || "")
-      : "";
-    const currentLength = currentAttributePresent ? [...currentValue].length : null;
+    const currentTitleValues = listing?.attributes?.item_name;
+    const currentHighlightValues = listing?.attributes?.title_differentiation;
+    const currentTitle = extractFirstValue(currentTitleValues);
+    const currentHighlight = extractFirstValue(currentHighlightValues);
 
     if (!dryRun) {
-      throw new Error("LIVE_REPAIR_BLOCKED: v1.1.0 requires a successful VALIDATION_PREVIEW before live repair is enabled");
+      throw new Error("LIVE_REPAIR_BLOCKED: v1.2.0 requires a successful combined title/highlight VALIDATION_PREVIEW before live repair is enabled");
     }
 
     const preview = await runValidationPreview(
       accessToken,
       sku,
       productType,
-      currentValues,
+      listing,
+      replacementTitle,
       replacementValue,
     );
 
-    const selected = preview.selected;
+    const selectedTitle = preview.selectedTitle;
+    const selectedHighlight = preview.selectedHighlight;
     const patchResponse = preview.patchResult?.json || {};
 
     return res.status(200).json({
@@ -301,15 +315,21 @@ async function handler(req, res) {
       attributeName,
       dryRun: true,
       productType,
-      currentAttributePresent,
-      currentValue,
-      currentLength,
+      currentTitlePresent: Array.isArray(currentTitleValues) && currentTitleValues.length > 0,
+      currentTitle,
+      currentTitleLength: currentTitle ? [...currentTitle].length : null,
+      currentHighlightPresent: Array.isArray(currentHighlightValues) && currentHighlightValues.length > 0,
+      currentHighlight,
+      currentHighlightLength: currentHighlight ? [...currentHighlight].length : null,
+      replacementTitle,
+      replacementTitleLength: [...replacementTitle].length,
       replacementValue,
       replacementLength: [...replacementValue].length,
-      validationPassed: Boolean(selected),
-      selectedStrategy: selected ? selected.strategy : "",
-      selectedOp: selected ? selected.op : "",
-      selectedValue: selected ? selected.value : null,
+      validationPassed: Boolean(selectedTitle && selectedHighlight),
+      selectedTitleStrategy: selectedTitle ? selectedTitle.strategy : "",
+      selectedTitleOp: selectedTitle ? selectedTitle.op : "",
+      selectedHighlightStrategy: selectedHighlight ? selectedHighlight.strategy : "",
+      selectedHighlightOp: selectedHighlight ? selectedHighlight.op : "",
       attempts: preview.attempts,
       patchResponse,
       externalChanges: 0,

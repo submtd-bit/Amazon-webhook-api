@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-18-b2b-fresh-get-v1.0.0";
+const MODULE_VERSION = "2026-08-24-b2b-fresh-get-v1.1.0";
 const ROUTE = "/amazon/price/b2b/fresh-get";
 const MAX_ITEMS = 50;
 const REQUEST_TIMEOUT_MS = 20000;
@@ -23,6 +23,16 @@ function numberOrNull(value) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isoOrEmpty(value) {
+  const t = Date.parse(String(value || ""));
+  return Number.isFinite(t) ? new Date(t).toISOString() : "";
+}
+
+function epochOrNull(value) {
+  const t = Date.parse(String(value || ""));
+  return Number.isFinite(t) ? t : null;
 }
 
 function getSecret() {
@@ -116,8 +126,46 @@ async function getListing(accessToken, sku) {
   return amazonGet(url, accessToken);
 }
 
-function getScheduleValue(offer, key) {
-  return offer?.[key]?.[0]?.schedule?.[0] || {};
+function getScheduleEntries(offer, key) {
+  const schedules = offer?.[key]?.[0]?.schedule;
+  return Array.isArray(schedules) ? schedules : [];
+}
+
+function scheduleIsActive(schedule, nowMs) {
+  const startMs = epochOrNull(schedule?.start_at);
+  const endMs = epochOrNull(schedule?.end_at);
+  if (startMs !== null && nowMs < startMs) return false;
+  if (endMs !== null && nowMs >= endMs) return false;
+  return true;
+}
+
+function getActiveScheduleValue(offer, key, nowMs) {
+  const active = getScheduleEntries(offer, key)
+    .filter(schedule => scheduleIsActive(schedule, nowMs))
+    .sort((a, b) => (epochOrNull(b?.start_at) ?? 0) - (epochOrNull(a?.start_at) ?? 0));
+  return active[0] || null;
+}
+
+function getScheduleDiagnostics(offer, key, nowMs) {
+  const schedules = getScheduleEntries(offer, key);
+  let activeCount = 0;
+  let expiredCount = 0;
+  let futureCount = 0;
+
+  schedules.forEach(schedule => {
+    const startMs = epochOrNull(schedule?.start_at);
+    const endMs = epochOrNull(schedule?.end_at);
+    if (scheduleIsActive(schedule, nowMs)) activeCount += 1;
+    else if (endMs !== null && nowMs >= endMs) expiredCount += 1;
+    else if (startMs !== null && nowMs < startMs) futureCount += 1;
+  });
+
+  return {
+    scheduleCount: schedules.length,
+    activeCount,
+    expiredCount,
+    futureCount,
+  };
 }
 
 function floorHundred(value) {
@@ -125,8 +173,8 @@ function floorHundred(value) {
   return Math.floor(value / 100) * 100;
 }
 
-function parseQuantityPlan(b2bOffer, b2bPrice) {
-  const schedule = b2bOffer?.quantity_discount_plan?.[0]?.schedule?.[0] || {};
+function parseQuantityPlan(b2bOffer, b2bPrice, nowMs) {
+  const schedule = getActiveScheduleValue(b2bOffer, "quantity_discount_plan", nowMs) || {};
   const discountType = String(schedule?.discount_type || "").toLowerCase();
   const levels = Array.isArray(schedule?.levels) ? schedule.levels : [];
 
@@ -159,7 +207,7 @@ function parseQuantityPlan(b2bOffer, b2bPrice) {
   };
 }
 
-function analyzeListing(listing) {
+function analyzeListing(listing, nowMs = Date.now()) {
   const summary = Array.isArray(listing?.summaries) ? listing.summaries[0] || {} : {};
   const attributes = listing?.attributes || {};
   const issues = Array.isArray(listing?.issues) ? listing.issues : [];
@@ -173,11 +221,12 @@ function analyzeListing(listing) {
   const consumer = offers.find(row => String(row?.audience || "ALL").toUpperCase() === "ALL") || null;
   const b2b = offers.find(row => String(row?.audience || "").toUpperCase() === "B2B") || null;
 
-  const normalSchedule = getScheduleValue(consumer, "our_price");
-  const saleSchedule = getScheduleValue(consumer, "discounted_price");
-  const minSchedule = getScheduleValue(consumer, "minimum_seller_allowed_price");
-  const b2bSchedule = getScheduleValue(b2b, "our_price");
+  const normalSchedule = getActiveScheduleValue(consumer, "our_price", nowMs);
+  const saleSchedule = getActiveScheduleValue(consumer, "discounted_price", nowMs);
+  const minSchedule = getActiveScheduleValue(consumer, "minimum_seller_allowed_price", nowMs);
+  const b2bSchedule = getActiveScheduleValue(b2b, "our_price", nowMs);
   const b2bPrice = numberOrNull(b2bSchedule?.value_with_tax);
+  const saleDiagnostics = getScheduleDiagnostics(consumer, "discounted_price", nowMs);
 
   return {
     asin: String(summary?.asin || ""),
@@ -192,10 +241,16 @@ function analyzeListing(listing) {
       normal: numberOrNull(normalSchedule?.value_with_tax),
       sale: numberOrNull(saleSchedule?.value_with_tax),
       minimumSellerAllowed: numberOrNull(minSchedule?.value_with_tax),
+      saleStartAt: saleSchedule ? isoOrEmpty(saleSchedule?.start_at) : "",
+      saleEndAt: saleSchedule ? isoOrEmpty(saleSchedule?.end_at) : "",
+      saleScheduleState: saleSchedule ? "ACTIVE" : (saleDiagnostics.expiredCount > 0 ? "EXPIRED" : (saleDiagnostics.futureCount > 0 ? "FUTURE" : "NONE")),
+      saleScheduleCount: saleDiagnostics.scheduleCount,
+      saleExpiredScheduleCount: saleDiagnostics.expiredCount,
+      saleFutureScheduleCount: saleDiagnostics.futureCount,
     },
     b2bOfferPresent: Boolean(b2b),
     b2bPrice,
-    quantityPlan: parseQuantityPlan(b2b, b2bPrice),
+    quantityPlan: parseQuantityPlan(b2b, b2bPrice, nowMs),
   };
 }
 
@@ -219,6 +274,7 @@ function normalizeItems(body) {
 
 async function handler(req, res) {
   const fetchedAt = new Date().toISOString();
+  const nowMs = Date.parse(fetchedAt);
   try {
     const secret = getSecret();
     if (!secret) return res.status(500).json({ ok: false, error: "AMAZON_STOCK_API_SECRET is not set" });
@@ -233,7 +289,7 @@ async function handler(req, res) {
     for (let i = 0; i < items.length; i += 1) {
       const item = items[i];
       try {
-        const state = analyzeListing(await getListing(accessToken, item.sku));
+        const state = analyzeListing(await getListing(accessToken, item.sku), nowMs);
         if (state.asin !== item.asin) {
           results.push({
             ok: false,

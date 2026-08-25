@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-25-s73-postregister-fix-v1.0.0";
+const MODULE_VERSION = "2026-08-25-s73-postregister-fix-v1.1.0";
 const ROUTE = "/amazon/listing/s73-postregister-fix";
 const REQUEST_TIMEOUT_MS = 20000;
 const VERIFY_ATTEMPTS = 5;
@@ -16,14 +16,13 @@ const GUARD = Object.freeze({
   confirmLive: "CONFIRM_S73_POSTREGISTER_B0HGDBYRS8_20260825",
   source: Object.freeze({
     conditionType: "new_new",
-    hardDiskSizeMissing: true,
     itemDisplayWeightGrams: 980,
     b2cPrice: 58000,
     b2bPrice: 52000,
     quantity: 0,
   }),
   target: Object.freeze({
-    conditionType: "refurbished_refurbished",
+    conditionTypeCandidate: "refurbished_refurbished",
     hardDiskSizeGB: 256,
     itemDisplayWeightGrams: 1189,
   }),
@@ -93,7 +92,8 @@ function assertSource(listing) {
   if (String(summary.asin || "") !== GUARD.asin) throw new Error("SOURCE_DRIFT: ASIN mismatch");
   if (String(summary.productType || "") !== GUARD.productType) throw new Error("SOURCE_DRIFT: productType mismatch");
   const a = listing?.attributes || {};
-  if (String(directValue(a, "condition_type") || "") !== GUARD.source.conditionType) throw new Error(`SOURCE_DRIFT: condition_type=${JSON.stringify(directValue(a, "condition_type"))}`);
+  const condition = String(directValue(a, "condition_type") || "");
+  if (condition !== GUARD.source.conditionType) throw new Error(`SOURCE_DRIFT: condition_type=${JSON.stringify(condition)}`);
   if (!numEq(directValue(a, "item_display_weight"), GUARD.source.itemDisplayWeightGrams)) throw new Error(`SOURCE_DRIFT: item_display_weight=${JSON.stringify(directValue(a, "item_display_weight"))}`);
   const hardDisk = a?.hard_disk?.[0] || {};
   if (!Array.isArray(a?.hard_disk) || a.hard_disk.length === 0) throw new Error("SOURCE_DRIFT: hard_disk missing");
@@ -103,19 +103,21 @@ function assertSource(listing) {
   if (!numEq(readQuantity(listing), GUARD.source.quantity)) throw new Error("SOURCE_DRIFT: quantity changed");
   return a;
 }
-function buildPatches(attributes) {
-  const condition = requireArrayAttribute(attributes, "condition_type");
-  condition[0].value = GUARD.target.conditionType;
+function buildCorePatches(attributes) {
   const hardDisk = requireArrayAttribute(attributes, "hard_disk");
   hardDisk[0].size = [{ unit: "GB", value: GUARD.target.hardDiskSizeGB }];
   const weight = requireArrayAttribute(attributes, "item_display_weight");
   weight[0].value = GUARD.target.itemDisplayWeightGrams;
   weight[0].unit = "grams";
   return [
-    { op: "replace", path: "/attributes/condition_type", value: condition },
     { op: "replace", path: "/attributes/hard_disk", value: hardDisk },
     { op: "replace", path: "/attributes/item_display_weight", value: weight },
   ];
+}
+function buildConditionPatch(attributes) {
+  const condition = requireArrayAttribute(attributes, "condition_type");
+  condition[0].value = GUARD.target.conditionTypeCandidate;
+  return { op: "replace", path: "/attributes/condition_type", value: condition };
 }
 async function patchListing(accessToken, sku, patches, preview) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
@@ -133,11 +135,10 @@ async function patchListing(accessToken, sku, patches, preview) {
   const status = String(json?.status || "").toUpperCase();
   return { httpStatus: response.status, responseOk: response.ok, status, submissionId: json?.submissionId || "", issueCount: issues.length, errorCount: errors.length, issues, valid: response.ok && errors.length === 0 && (status === "VALID" || status === "ACCEPTED") };
 }
-function verifyTarget(listing) {
+function verifyTarget(listing, conditionAttemptedAndAccepted) {
   const a = listing?.attributes || {};
   const issues = Array.isArray(listing?.issues) ? listing.issues : [];
   const checks = {
-    conditionRefurbished: String(directValue(a, "condition_type") || "") === GUARD.target.conditionType,
     hardDisk256GB: numEq(nestedValue(a, "hard_disk", "size"), GUARD.target.hardDiskSizeGB),
     itemWeight1189g: numEq(directValue(a, "item_display_weight"), GUARD.target.itemDisplayWeightGrams),
     b2cPriceUnchanged: numEq(readOfferPrice(listing, "B2C"), GUARD.source.b2cPrice),
@@ -145,6 +146,11 @@ function verifyTarget(listing) {
     quantityStill0: numEq(readQuantity(listing), GUARD.source.quantity),
     warning18448Cleared: !issues.some(x => String(x?.code || "") === "18448"),
   };
+  if (conditionAttemptedAndAccepted) {
+    checks.conditionRefurbished = String(directValue(a, "condition_type") || "") === GUARD.target.conditionTypeCandidate;
+  } else {
+    checks.conditionUnchanged = String(directValue(a, "condition_type") || "") === GUARD.source.conditionType;
+  }
   return { verified: Object.values(checks).every(Boolean), checks, issues, snapshot: { conditionType: directValue(a, "condition_type"), hardDisk: a.hard_disk || [], itemDisplayWeight: a.item_display_weight || [], offers: listing.offers || [], fulfillmentAvailability: listing.fulfillmentAvailability || [] } };
 }
 async function handler(req, res) {
@@ -161,23 +167,61 @@ async function handler(req, res) {
     const token = await getLwaAccessToken();
     const before = await getListing(token, sku);
     const attributes = assertSource(before);
-    const patches = buildPatches(attributes);
-    const freshPreview = await patchListing(token, sku, patches, true);
-    if (!freshPreview.valid) throw new Error(`LIVE_GUARD_BLOCKED: fresh VALIDATION_PREVIEW failed ${JSON.stringify(freshPreview)}`);
-    const liveResult = await patchListing(token, sku, patches, false);
+    const corePatches = buildCorePatches(attributes);
+    const conditionPatch = buildConditionPatch(attributes);
+
+    const combinedPreview = await patchListing(token, sku, [conditionPatch, ...corePatches], true);
+    let conditionApplied = false;
+    let selectedPreview = combinedPreview;
+    let selectedPatches = [conditionPatch, ...corePatches];
+
+    if (!combinedPreview.valid) {
+      const corePreview = await patchListing(token, sku, corePatches, true);
+      if (!corePreview.valid) throw new Error(`LIVE_GUARD_BLOCKED: core VALIDATION_PREVIEW failed ${JSON.stringify(corePreview)}`);
+      selectedPreview = corePreview;
+      selectedPatches = corePatches;
+    } else {
+      conditionApplied = true;
+    }
+
+    const liveResult = await patchListing(token, sku, selectedPatches, false);
     livePatchSent = true;
-    if (!liveResult.valid) return res.status(502).json({ ok: false, moduleVersion: MODULE_VERSION, route: ROUTE, sku, asin: GUARD.asin, livePatchSent: true, freshPreview, liveResult, postVerified: false, externalChanges: 0, error: "LIVE_PATCH_RESPONSE_NOT_ACCEPTED" });
+    if (!liveResult.valid) return res.status(502).json({ ok: false, moduleVersion: MODULE_VERSION, route: ROUTE, sku, asin: GUARD.asin, livePatchSent: true, combinedPreview, selectedPreview, conditionApplied, liveResult, postVerified: false, externalChanges: 0, error: "LIVE_PATCH_RESPONSE_NOT_ACCEPTED" });
 
     let verification = null;
     const verificationAttempts = [];
     for (let attempt = 1; attempt <= VERIFY_ATTEMPTS; attempt += 1) {
       if (attempt > 1) await sleep(VERIFY_GAP_MS);
-      verification = verifyTarget(await getListing(token, sku));
+      verification = verifyTarget(await getListing(token, sku), conditionApplied);
       verificationAttempts.push({ attempt, verified: verification.verified, checks: verification.checks });
       if (verification.verified) break;
     }
     const postVerified = Boolean(verification?.verified);
-    return res.status(200).json({ ok: postVerified, moduleVersion: MODULE_VERSION, route: ROUTE, sku, asin: GUARD.asin, productType: GUARD.productType, freshPreview, livePatchSent: true, livePatchAttempts: 1, liveResult, postVerified, verificationAttempts, finalSnapshot: verification?.snapshot || {}, finalIssues: verification?.issues || [], externalChanges: postVerified ? 1 : 0, verificationPending: !postVerified, note: postVerified ? "S73 condition, storage size and weight updated and verified" : "LIVE PATCH accepted once but propagation was not fully visible; do not retry automatically" });
+    return res.status(200).json({
+      ok: postVerified,
+      moduleVersion: MODULE_VERSION,
+      route: ROUTE,
+      sku,
+      asin: GUARD.asin,
+      productType: GUARD.productType,
+      conditionCandidate: GUARD.target.conditionTypeCandidate,
+      conditionApplied,
+      conditionPreviewAccepted: combinedPreview.valid,
+      conditionPreviewIssues: combinedPreview.valid ? [] : combinedPreview.issues,
+      selectedPreview,
+      livePatchSent: true,
+      livePatchAttempts: 1,
+      liveResult,
+      postVerified,
+      verificationAttempts,
+      finalSnapshot: verification?.snapshot || {},
+      finalIssues: verification?.issues || [],
+      externalChanges: postVerified ? 1 : 0,
+      verificationPending: !postVerified,
+      note: postVerified
+        ? (conditionApplied ? "S73 condition, storage size and weight updated and verified" : "S73 storage size and weight updated and verified; Amazon rejected the attempted refurbished condition enum, so condition was left unchanged")
+        : "LIVE PATCH accepted once but propagation was not fully visible; do not retry automatically",
+    });
   } catch (err) {
     return res.status(400).json({ ok: false, moduleVersion: MODULE_VERSION, route: ROUTE, livePatchSent, livePatchAttempts: livePatchSent ? 1 : 0, externalChanges: 0, error: err?.message || String(err) });
   }

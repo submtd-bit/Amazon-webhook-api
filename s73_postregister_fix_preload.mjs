@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-25-s73-postregister-fix-v1.1.0";
+const MODULE_VERSION = "2026-08-25-s73-postregister-fix-v1.1.1";
 const ROUTE = "/amazon/listing/s73-postregister-fix";
 const REQUEST_TIMEOUT_MS = 20000;
 const VERIFY_ATTEMPTS = 5;
@@ -19,7 +19,7 @@ const GUARD = Object.freeze({
     itemDisplayWeightGrams: 980,
     b2cPrice: 58000,
     b2bPrice: 52000,
-    quantity: 0,
+    quantity: 10,
   }),
   target: Object.freeze({
     conditionTypeCandidate: "refurbished_refurbished",
@@ -143,7 +143,7 @@ function verifyTarget(listing, conditionAttemptedAndAccepted) {
     itemWeight1189g: numEq(directValue(a, "item_display_weight"), GUARD.target.itemDisplayWeightGrams),
     b2cPriceUnchanged: numEq(readOfferPrice(listing, "B2C"), GUARD.source.b2cPrice),
     b2bPriceUnchanged: numEq(readOfferPrice(listing, "B2B"), GUARD.source.b2bPrice),
-    quantityStill0: numEq(readQuantity(listing), GUARD.source.quantity),
+    quantityStill10: numEq(readQuantity(listing), GUARD.source.quantity),
     warning18448Cleared: !issues.some(x => String(x?.code || "") === "18448"),
   };
   if (conditionAttemptedAndAccepted) {

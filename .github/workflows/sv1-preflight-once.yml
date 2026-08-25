@@ -1,0 +1,40 @@
+name: SV1 preflight once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sv1-preflight-once.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Wait for Render and call dry-run bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://amazon-webhook-api.onrender.com/__tmp/sv1-preflight/8d6c1f4a6b0e4aa898bb6f5748b3d26e?token=e9d4e7f30ff44e2c8b8c30bc629dbf31d79c4a26c9324f5680db9158ed47f1d0'
+          for i in $(seq 1 24); do
+            echo "attempt=$i"
+            code=$(curl -sS --max-time 40 -o response.json -w '%{http_code}' "$URL" || true)
+            echo "http=$code"
+            cat response.json 2>/dev/null || true
+            echo
+            if [ "$code" = "200" ]; then
+              python - <<'PY'
+          import json
+          with open('response.json', encoding='utf-8') as f:
+              j=json.load(f)
+          assert j.get('ok') is True, j
+          assert j.get('status') == 'DRY_RUN_VALIDATED', j
+          assert j.get('externalChanges') == 0, j
+          print('SV1_DRY_RUN_VALIDATED')
+          print(json.dumps(j, ensure_ascii=False, indent=2))
+          PY
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'SV1 preflight never returned HTTP 200' >&2
+          exit 1

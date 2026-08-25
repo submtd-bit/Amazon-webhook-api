@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-25-s73-listing-preview-v1.0.0";
+const MODULE_VERSION = "2026-08-25-s73-listing-preview-v1.1.0";
 const ROUTE = "/amazon/listing/s73-preview";
 const REQUEST_TIMEOUT_MS = 20000;
 const originalListen = express.application.listen;
@@ -11,6 +11,7 @@ const GUARD = Object.freeze({
   sku: "7X-725F-2ZML",
   asin: "B0HGDBYRS8",
   productType: "NOTEBOOK_COMPUTER",
+  cpuFamily: "intel_core_i5_1135g7",
   title: "【整備済み品】ダイナブック S73/HS 13.3型 i5-1135G7 16GB SSD256GB Win11 Pro ノートン・Office付",
 });
 
@@ -113,7 +114,10 @@ function buildPatches(attributes) {
   patches.push({ op: "replace", path: "/attributes/item_name", value: title });
 
   const cpu = requireArrayAttribute(attributes, "cpu_model");
-  setNestedFirst(cpu[0], "family", "value", "core_i5_1135g7");
+  const liveFamily = String(cpu?.[0]?.family?.[0]?.value || "");
+  if (liveFamily !== GUARD.cpuFamily) {
+    throw new Error(`CPU_FAMILY_DRIFT: expected ${GUARD.cpuFamily}, got ${liveFamily || "(missing)"}`);
+  }
   setNestedFirst(cpu[0], "manufacturer", "value", "Intel");
   setNestedFirst(cpu[0], "model_number", "value", "1135G7");
   setNestedFirst(cpu[0], "speed", "value", 2.4);
@@ -232,6 +236,7 @@ async function handler(req, res) {
       sku,
       asin: summary.asin,
       productType: summary.productType,
+      preservedCpuFamily: GUARD.cpuFamily,
       targetTitle: GUARD.title,
       targetTitleLength: [...GUARD.title].length,
       targetFacts: {

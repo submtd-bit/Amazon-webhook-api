@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-22-amazon-listing-issue-inspect-v1.0.0";
+const MODULE_VERSION = "2026-08-25-amazon-listing-issue-inspect-v1.1.0";
 const ROUTE = "/amazon/listing/issue-inspect";
 const REQUEST_TIMEOUT_MS = 20000;
 const originalListen = express.application.listen;
@@ -106,6 +106,18 @@ function summarizeAttribute(values) {
   };
 }
 
+function isRelevantAttributeKey(key) {
+  return /title|name|brand|manufacturer|model|part|cpu|processor|memory|ram|storage|ssd|hard|operating|system|screen|display|resolution|battery|lithium|watt|hazmat|danger|un_|norton|software|office/i.test(key);
+}
+
+function pickRelevantAttributes(attributes) {
+  const result = {};
+  for (const key of Object.keys(attributes).sort()) {
+    if (isRelevantAttributeKey(key)) result[key] = attributes[key];
+  }
+  return result;
+}
+
 async function handler(req, res) {
   try {
     const secret = getSecret();
@@ -125,6 +137,7 @@ async function handler(req, res) {
     const issues = Array.isArray(listing?.issues) ? listing.issues : [];
     const errorIssues = issues.filter(issue => String(issue?.severity || "").toUpperCase() === "ERROR");
     const attributeKeys = Object.keys(attributes).sort();
+    const relevantAttributes = pickRelevantAttributes(attributes);
 
     return res.status(200).json({
       ok: true,
@@ -140,7 +153,9 @@ async function handler(req, res) {
       lastUpdatedDate: summary.lastUpdatedDate || listing.lastUpdatedDate || "",
       itemNameAttribute: summarizeAttribute(attributes.item_name),
       titleDifferentiationAttribute: summarizeAttribute(attributes.title_differentiation),
-      relevantAttributeKeys: attributeKeys.filter(key => /title|name|differentiation/i.test(key)),
+      relevantAttributeKeys: Object.keys(relevantAttributes),
+      relevantAttributes,
+      attributeKeys,
       attributeKeyCount: attributeKeys.length,
       issueCount: issues.length,
       errorCount: errorIssues.length,

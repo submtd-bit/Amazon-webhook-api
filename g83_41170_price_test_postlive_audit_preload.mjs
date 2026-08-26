@@ -1,0 +1,29 @@
+import express from "express";
+import fetch from "node-fetch";
+import "dotenv/config";
+
+const MODULE_VERSION = "2026-08-26-g83-41170-postlive-audit-v1.0.0";
+const ROUTE = "/amazon/price/g83/41170-test/postlive-audit";
+const SKU = "E7-YLJ3-F9CY";
+const ASIN = "B0GZBHBQN2";
+const EXPECTED_NORMAL = 58000;
+const EXPECTED_SALE = 41170;
+const EXPECTED_MIN = 36100;
+const EXPECTED_B2B = 39900;
+const originalPost = express.application.post;
+const originalUse = express.application.use;
+
+function parse(text){try{return text?JSON.parse(text):{};}catch{return{rawText:text};}}
+function num(v){if(v===null||v===undefined||v==="")return null;const n=Number(v);return Number.isFinite(n)?n:null;}
+function epoch(v){const t=Date.parse(String(v||""));return Number.isFinite(t)?t:null;}
+function secret(){return String(process.env.AMAZON_STOCK_API_SECRET||"").trim();}
+function cfg(){const sellerId=String(process.env.SPAPI_SELLER_ID||"").trim();const marketplaceId=String(process.env.SPAPI_MARKETPLACE_ID||"A1VC38T7YXB528").trim();const endpoint=String(process.env.SPAPI_ENDPOINT||"https://sellingpartnerapi-fe.amazon.com").replace(/\/$/,"");if(!sellerId)throw new Error("Missing env: SPAPI_SELLER_ID");return{sellerId,marketplaceId,endpoint};}
+async function lwa(){const clientId=process.env.LWA_CLIENT_ID,clientSecret=process.env.LWA_CLIENT_SECRET,refreshToken=process.env.REFRESH_TOKEN;if(!clientId||!clientSecret||!refreshToken)throw new Error("Missing LWA env");const r=await fetch("https://api.amazon.com/auth/o2/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"refresh_token",refresh_token:refreshToken,client_id:clientId,client_secret:clientSecret})});const j=parse(await r.text());if(!r.ok||!j.access_token)throw new Error(`LWA token error: ${r.status}`);return j.access_token;}
+async function getListing(token){const{sellerId,marketplaceId,endpoint}=cfg();const q=new URLSearchParams({marketplaceIds:marketplaceId,includedData:"summaries,attributes,issues,fulfillmentAvailability",issueLocale:"ja_JP"});const r=await fetch(`${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(SKU)}?${q}`,{headers:{"x-amz-access-token":token,accept:"application/json"}});const j=parse(await r.text());if(!r.ok)throw new Error(`SP-API GET error: ${r.status} ${JSON.stringify(j)}`);return j;}
+function schedules(o,k){const s=o?.[k]?.[0]?.schedule;return Array.isArray(s)?s:[];}
+function active(o,k,now){return schedules(o,k).filter(s=>{const st=epoch(s?.start_at),en=epoch(s?.end_at);return(st===null||now>=st)&&(en===null||now<en);}).sort((a,b)=>(epoch(b?.start_at)??0)-(epoch(a?.start_at)??0))[0]||null;}
+function qp(o){return o?.quantity_discount_plan??o?.quantity_discount_plans??null;}
+function qpOk(plan){const t=JSON.stringify(plan).toLowerCase();return t.includes("percent")&&/"lower_?bound"\s*:\s*10(?:\.0+)?/.test(t)&&/"value"\s*:\s*3(?:\.0+)?/.test(t);}
+async function handler(req,res){try{const sec=secret();if(!sec)return res.status(500).json({ok:false,readOnly:true,externalChanges:0,error:"secret missing"});if(String(req.headers["x-api-secret"]||"")!==sec)return res.status(401).json({ok:false,readOnly:true,externalChanges:0,error:"Unauthorized"});const now=Date.now();const raw=await getListing(await lwa());const summary=Array.isArray(raw?.summaries)?raw.summaries[0]||{}:{};const attrs=raw?.attributes||{};const issues=Array.isArray(raw?.issues)?raw.issues:[];const av=Array.isArray(raw?.fulfillmentAvailability)?raw.fulfillmentAvailability[0]||{}:{};const offers=Array.isArray(attrs?.purchasable_offer)?attrs.purchasable_offer:[];const consumer=offers.find(o=>String(o?.audience||"ALL").toUpperCase()==="ALL")||null;const b2b=offers.find(o=>String(o?.audience||"").toUpperCase()==="B2B")||null;const sale=active(consumer,"discounted_price",now);const plan=qp(b2b);const state={asin:String(summary?.asin||""),statuses:Array.isArray(summary?.status)?summary.status.map(String):[],listingErrorCount:issues.filter(x=>String(x?.severity||"").toUpperCase()==="ERROR").length,availableQuantity:num(av?.quantity)??num(attrs?.fulfillment_availability?.[0]?.quantity)??0,normalPrice:num(active(consumer,"our_price",now)?.value_with_tax),activeSalePrice:num(sale?.value_with_tax),activeSaleStart:sale?.start_at||null,activeSaleEnd:sale?.end_at||null,minimumSellerAllowedPrice:num(active(consumer,"minimum_seller_allowed_price",now)?.value_with_tax),b2bPrice:num(active(b2b,"our_price",now)?.value_with_tax),quantityDiscountPlan:plan};const checks={asin:state.asin===ASIN,buyable:state.statuses.includes("BUYABLE"),listingErrorsZero:state.listingErrorCount===0,normalPricePreserved:state.normalPrice===EXPECTED_NORMAL,activeSaleApplied:state.activeSalePrice===EXPECTED_SALE,minimumSellerAllowedPricePreserved:state.minimumSellerAllowedPrice===EXPECTED_MIN,b2bPricePreserved:state.b2bPrice===EXPECTED_B2B,quantityDiscountPlanPreserved:qpOk(plan)};const pass=Object.values(checks).every(Boolean);return res.status(pass?200:409).json({ok:pass,moduleVersion:MODULE_VERSION,status:pass?"POSTLIVE_AUDIT_PASS":"POSTLIVE_AUDIT_FAIL",readOnly:true,externalChanges:0,sku:SKU,asin:ASIN,auditAt:new Date(now).toISOString(),state,checks,pass});}catch(err){return res.status(500).json({ok:false,moduleVersion:MODULE_VERSION,readOnly:true,externalChanges:0,error:err?.message||String(err)});}}
+express.application.post=function patchedPost(path,...handlers){if(path===ROUTE)return originalPost.call(this,path,...handlers);return originalPost.call(this,path,...handlers);};
+express.application.use=function patchedUse(...args){const result=originalUse.apply(this,args);if(!this.__g8341170PostliveAuditInstalled){this.__g8341170PostliveAuditInstalled=true;originalPost.call(this,ROUTE,handler);console.log(`${MODULE_VERSION} route installed: POST ${ROUTE}`);}return result;};

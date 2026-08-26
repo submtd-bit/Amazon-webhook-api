@@ -1,6 +1,7 @@
 import { registerAmazonAdsDecisionRoutes as registerLegacyAmazonAdsDecisionRoutes } from './amazon_ads_routes_legacy.js';
 
 const INACTIVE_AUDIT_VERSION = 'AMAZON_INACTIVE_AUDIT_V1.0.0';
+const IMAGE_SUPPRESSION_AUDIT_VERSION = 'AMAZON_IMAGE_SUPPRESSION_AUDIT_V1.0.0';
 const BENCHMARK_ASIN = 'B0GHY9J1NF';
 const BENCHMARK_SKU = 'x13g1-i5-10210u-8gb-ssd1';
 const KNOWN_ENFORCEMENTS = [
@@ -149,6 +150,104 @@ function registerAmazonAdsDecisionRoutes(app, deps) {
       });
     }
   });
+
+  app.post('/ads/listings/image-suppression-audit', requireSecret, async (req, res) => {
+    try {
+      const skus = uniqueStrings(Array.isArray(req.body?.skus) ? req.body.skus : []);
+      if (!skus.length) {
+        return res.status(400).json({
+          version: IMAGE_SUPPRESSION_AUDIT_VERSION,
+          readOnly: true,
+          externalChanges: 0,
+          error: 'skus is required'
+        });
+      }
+      if (skus.length > 50) {
+        return res.status(400).json({
+          version: IMAGE_SUPPRESSION_AUDIT_VERSION,
+          readOnly: true,
+          externalChanges: 0,
+          error: 'max 50 skus per request'
+        });
+      }
+
+      const results = [];
+      for (const sku of skus) {
+        try {
+          const raw = await spApiRequest({
+            method: 'GET',
+            path: `/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(sku)}`,
+            query: {
+              marketplaceIds: marketplaceId,
+              issueLocale: 'ja_JP',
+              includedData: 'summaries,attributes,issues'
+            }
+          });
+
+          const summaries = Array.isArray(raw?.summaries) ? raw.summaries : [];
+          const summary = summaries.find(x => !x?.marketplaceId || x.marketplaceId === marketplaceId) || summaries[0] || {};
+          const issues = Array.isArray(raw?.issues) ? raw.issues : [];
+          const imageIssues = issues.filter(issue => {
+            const code = String(issue?.code || '').trim();
+            const message = String(issue?.message || '');
+            const attributes = Array.isArray(issue?.attributeNames) ? issue.attributeNames : [];
+            return code === '100238' ||
+              code === '18320' ||
+              /画像|image/i.test(message) ||
+              attributes.some(name => /image|media|locator/i.test(String(name || '')));
+          });
+
+          results.push({
+            sku,
+            asin: String(summary.asin || '').trim(),
+            title: String(summary.itemName || '').trim(),
+            status: Array.isArray(summary.status) ? summary.status : [],
+            imageIssueCount: imageIssues.length,
+            imageIssues: imageIssues.map(issue => ({
+              code: String(issue?.code || ''),
+              severity: String(issue?.severity || ''),
+              message: String(issue?.message || ''),
+              attributeNames: Array.isArray(issue?.attributeNames) ? issue.attributeNames : [],
+              enforcementActions: collectKnownEnforcements([issue])
+            })),
+            mediaAttributes: extractMediaAttributes(raw?.attributes || {}),
+            apiError: ''
+          });
+        } catch (error) {
+          results.push({
+            sku,
+            asin: '',
+            title: '',
+            status: [],
+            imageIssueCount: 0,
+            imageIssues: [],
+            mediaAttributes: {},
+            apiError: error.message || String(error)
+          });
+        }
+
+        if (skus.length > 1) await waitAuditMs(250);
+      }
+
+      res.json({
+        version: IMAGE_SUPPRESSION_AUDIT_VERSION,
+        readOnly: true,
+        externalChanges: 0,
+        marketplaceId,
+        requestedSkuCount: skus.length,
+        apiErrorCount: results.filter(x => x.apiError).length,
+        imageIssueSkuCount: results.filter(x => x.imageIssueCount > 0).length,
+        results
+      });
+    } catch (error) {
+      res.status(500).json({
+        version: IMAGE_SUPPRESSION_AUDIT_VERSION,
+        readOnly: true,
+        externalChanges: 0,
+        error: error.message || String(error)
+      });
+    }
+  });
 }
 
 function normalizeInactiveAuditItem(raw, marketplaceId) {
@@ -226,6 +325,18 @@ function normalizeInactiveAuditItem(raw, marketplaceId) {
       categories: Array.isArray(x?.categories) ? x.categories : []
     }))
   };
+}
+
+function extractMediaAttributes(attributes) {
+  const out = {};
+  if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) return out;
+
+  for (const [key, value] of Object.entries(attributes)) {
+    if (/image|media|locator/i.test(String(key || ''))) {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 function collectKnownEnforcements(issues) {

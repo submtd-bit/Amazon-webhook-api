@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-08-25-amazon-listing-issue-inspect-v1.1.0";
+const MODULE_VERSION = "2026-08-27-amazon-listing-issue-inspect-v1.2.0";
 const ROUTE = "/amazon/listing/issue-inspect";
 const REQUEST_TIMEOUT_MS = 20000;
 const originalListen = express.application.listen;
@@ -107,7 +107,7 @@ function summarizeAttribute(values) {
 }
 
 function isRelevantAttributeKey(key) {
-  return /title|name|brand|manufacturer|model|part|cpu|processor|memory|ram|storage|ssd|hard|operating|system|screen|display|resolution|battery|lithium|watt|hazmat|danger|un_|norton|software|office/i.test(key);
+  return /title|name|brand|manufacturer|model|part|cpu|processor|memory|ram|storage|ssd|hard|operating|system|screen|display|resolution|battery|lithium|watt|hazmat|danger|condition|un_|norton|software|office/i.test(key);
 }
 
 function pickRelevantAttributes(attributes) {
@@ -153,6 +153,7 @@ async function handler(req, res) {
       lastUpdatedDate: summary.lastUpdatedDate || listing.lastUpdatedDate || "",
       itemNameAttribute: summarizeAttribute(attributes.item_name),
       titleDifferentiationAttribute: summarizeAttribute(attributes.title_differentiation),
+      conditionTypeAttribute: summarizeAttribute(attributes.condition_type),
       relevantAttributeKeys: Object.keys(relevantAttributes),
       relevantAttributes,
       attributeKeys,

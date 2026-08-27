@@ -1,6 +1,7 @@
 import { registerAmazonAdsDecisionRoutes as registerLegacyAmazonAdsDecisionRoutes } from './amazon_ads_routes_legacy.js';
 
 const INACTIVE_AUDIT_VERSION = 'AMAZON_INACTIVE_AUDIT_V1.0.0';
+const NONBUYABLE_DEEP_AUDIT_VERSION = 'AMAZON_NONBUYABLE_NO_REASON_DEEP_AUDIT_V1.0.0';
 const IMAGE_SUPPRESSION_AUDIT_VERSION = 'AMAZON_IMAGE_SUPPRESSION_AUDIT_V1.0.0';
 const BENCHMARK_ASIN = 'B0GHY9J1NF';
 const BENCHMARK_SKU = 'x13g1-i5-10210u-8gb-ssd1';
@@ -144,6 +145,125 @@ function registerAmazonAdsDecisionRoutes(app, deps) {
     } catch (error) {
       res.status(500).json({
         version: INACTIVE_AUDIT_VERSION,
+        readOnly: true,
+        externalChanges: 0,
+        error: error.message || String(error)
+      });
+    }
+  });
+
+  app.post('/ads/listings/nonbuyable-no-reason-audit', requireSecret, async (req, res) => {
+    try {
+      const maxPagesRequested = Number(req.body?.maxPages || 250);
+      const maxPages = Number.isFinite(maxPagesRequested)
+        ? Math.max(1, Math.min(500, Math.floor(maxPagesRequested)))
+        : 250;
+
+      const all = [];
+      const seenSkus = new Set();
+      let pageToken = '';
+      let pageCount = 0;
+
+      do {
+        pageCount += 1;
+        if (pageCount > maxPages) {
+          throw new Error(`NONBUYABLE_DEEP_AUDIT_PAGE_LIMIT_EXCEEDED: maxPages=${maxPages}`);
+        }
+
+        const query = {
+          marketplaceIds: marketplaceId,
+          issueLocale: 'ja_JP',
+          includedData: 'summaries,issues,fulfillmentAvailability',
+          withoutStatus: 'BUYABLE',
+          sortBy: 'sku',
+          sortOrder: 'ASC',
+          pageSize: 20
+        };
+        if (pageToken) query.pageToken = pageToken;
+
+        const data = await spApiRequest({
+          method: 'GET',
+          path: `/listings/2021-08-01/items/${encodeURIComponent(sellerId)}`,
+          query
+        });
+
+        const pageItems = Array.isArray(data?.items) ? data.items : [];
+        for (const raw of pageItems) {
+          const item = normalizeInactiveAuditItem(raw, marketplaceId);
+          if (!item.sku || seenSkus.has(item.sku)) continue;
+          seenSkus.add(item.sku);
+          all.push(item);
+        }
+
+        pageToken = String(
+          data?.pagination?.nextToken ||
+          data?.pagination?.NextToken ||
+          data?.nextToken ||
+          data?.NextToken ||
+          ''
+        ).trim();
+        if (pageToken) await waitAuditMs(250);
+      } while (pageToken);
+
+      const targets = all.filter(x => x.reasonClass === 'NON_BUYABLE_NO_API_REASON');
+      const results = [];
+
+      for (const target of targets) {
+        try {
+          const raw = await spApiRequest({
+            method: 'GET',
+            path: `/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(target.sku)}`,
+            query: {
+              marketplaceIds: marketplaceId,
+              issueLocale: 'ja_JP',
+              includedData: 'summaries,attributes,issues,offers,fulfillmentAvailability'
+            }
+          });
+
+          results.push(buildDeepNonBuyableDiagnostics(target, raw, marketplaceId));
+        } catch (error) {
+          results.push({
+            sku: target.sku,
+            asin: target.asin,
+            title: target.title,
+            initialReasonClass: target.reasonClass,
+            initialStatus: splitStatuses(target.status),
+            initialAvailableQuantity: target.availableQuantity,
+            deepFetchOk: false,
+            deepFetchError: error.message || String(error),
+            rootCauseConfirmed: false,
+            primaryDiagnostic: 'DEEP_GET_API_ERROR',
+            diagnosticSignals: ['DEEP_GET_API_ERROR']
+          });
+        }
+        if (targets.length > 1) await waitAuditMs(250);
+      }
+
+      const diagnosticCounts = {};
+      for (const row of results) {
+        const key = String(row.primaryDiagnostic || 'UNKNOWN');
+        diagnosticCounts[key] = Number(diagnosticCounts[key] || 0) + 1;
+      }
+
+      res.json({
+        version: NONBUYABLE_DEEP_AUDIT_VERSION,
+        readOnly: true,
+        externalChanges: 0,
+        marketplaceId,
+        scope: 'CURRENT_NON_BUYABLE_NO_API_REASON_ONLY',
+        pageCount,
+        inactiveCandidateCount: all.length,
+        targetCount: targets.length,
+        targetSkus: targets.map(x => x.sku),
+        deepFetchOkCount: results.filter(x => x.deepFetchOk).length,
+        deepFetchErrorCount: results.filter(x => !x.deepFetchOk).length,
+        rootCauseConfirmedCount: results.filter(x => x.rootCauseConfirmed).length,
+        diagnosticCounts,
+        results
+      });
+    } catch (error) {
+      res.status(500).json({
+        version: NONBUYABLE_DEEP_AUDIT_VERSION,
         readOnly: true,
         externalChanges: 0,
         error: error.message || String(error)
@@ -327,6 +447,129 @@ function normalizeInactiveAuditItem(raw, marketplaceId) {
   };
 }
 
+function buildDeepNonBuyableDiagnostics(initial, raw, marketplaceId) {
+  const summaries = Array.isArray(raw?.summaries) ? raw.summaries : [];
+  const summary = summaries.find(x => !x?.marketplaceId || x.marketplaceId === marketplaceId) || summaries[0] || {};
+  const statuses = Array.isArray(summary.status)
+    ? summary.status.map(x => String(x || '').trim()).filter(Boolean)
+    : String(summary.status || '').split(',').map(x => x.trim()).filter(Boolean);
+  const attributes = raw?.attributes && typeof raw.attributes === 'object' && !Array.isArray(raw.attributes) ? raw.attributes : {};
+  const issues = Array.isArray(raw?.issues) ? raw.issues : [];
+  const offers = Array.isArray(raw?.offers) ? raw.offers : [];
+  const availability = Array.isArray(raw?.fulfillmentAvailability) ? raw.fulfillmentAvailability : [];
+  const errorIssues = issues.filter(x => String(x?.severity || '').toUpperCase() === 'ERROR');
+  const warningIssues = issues.filter(x => String(x?.severity || '').toUpperCase() === 'WARNING');
+  const enforcementActions = collectKnownEnforcements(issues);
+  const quantities = availability.map(x => Number(x?.quantity || 0)).filter(Number.isFinite);
+  const availableQuantity = quantities.reduce((sum, value) => sum + Math.max(0, value), 0);
+  const b2cOffer = offers.find(x => String(x?.offerType || '').toUpperCase() === 'B2C') || null;
+  const b2bOffer = offers.find(x => String(x?.offerType || '').toUpperCase() === 'B2B') || null;
+  const b2cPrice = finiteNumberOrNull(b2cOffer?.price?.amount);
+  const b2bPrice = finiteNumberOrNull(b2bOffer?.price?.amount);
+  const conditionType = String(attributes?.condition_type?.[0]?.value || '').trim();
+  const skipOfferValue = attributes?.skip_offer?.[0]?.value;
+  const skipOfferTrue = skipOfferValue === true || String(skipOfferValue || '').toLowerCase() === 'true';
+  const purchasableOfferRows = Array.isArray(attributes?.purchasable_offer) ? attributes.purchasable_offer : [];
+  const fulfillmentAttributeRows = Array.isArray(attributes?.fulfillment_availability) ? attributes.fulfillment_availability : [];
+  const merchantShippingGroup = attributes?.merchant_shipping_group || [];
+  const listPrice = attributes?.list_price || [];
+  const mainImage = attributes?.main_product_image_locator || [];
+
+  const diagnosticSignals = [];
+  let primaryDiagnostic = 'NO_BLOCKING_SIGNAL_AFTER_DEEP_GET';
+  let rootCauseConfirmed = false;
+
+  if (statuses.includes('BUYABLE')) {
+    primaryDiagnostic = 'RECOVERED_DURING_DEEP_GET';
+    rootCauseConfirmed = true;
+    diagnosticSignals.push('RECOVERED_DURING_DEEP_GET');
+  } else if (enforcementActions.length) {
+    primaryDiagnostic = 'DEEP_ENFORCEMENT_FOUND';
+    rootCauseConfirmed = true;
+    diagnosticSignals.push('DEEP_ENFORCEMENT_FOUND');
+  } else if (errorIssues.length) {
+    primaryDiagnostic = 'DEEP_ERROR_FOUND';
+    rootCauseConfirmed = true;
+    diagnosticSignals.push('DEEP_ERROR_FOUND');
+  } else if (availableQuantity <= 0) {
+    primaryDiagnostic = 'DEEP_ZERO_STOCK_FOUND';
+    rootCauseConfirmed = true;
+    diagnosticSignals.push('DEEP_ZERO_STOCK_FOUND');
+  }
+
+  if (!b2cOffer) diagnosticSignals.push('B2C_OFFER_MISSING');
+  else if (!(Number.isFinite(b2cPrice) && b2cPrice > 0)) diagnosticSignals.push('B2C_PRICE_MISSING_OR_INVALID');
+  if (!purchasableOfferRows.length) diagnosticSignals.push('PURCHASABLE_OFFER_ATTRIBUTE_MISSING');
+  if (skipOfferTrue) diagnosticSignals.push('SKIP_OFFER_TRUE');
+  if (!conditionType) diagnosticSignals.push('CONDITION_TYPE_MISSING');
+  if (!mainImage.length) diagnosticSignals.push('MAIN_IMAGE_ATTRIBUTE_MISSING');
+  if (!fulfillmentAttributeRows.length) diagnosticSignals.push('FULFILLMENT_ATTRIBUTE_MISSING');
+  if (!issues.length) diagnosticSignals.push('NO_ISSUES_RETURNED');
+  if (!enforcementActions.length) diagnosticSignals.push('NO_ENFORCEMENT_RETURNED');
+
+  if (!rootCauseConfirmed) {
+    if (diagnosticSignals.includes('B2C_OFFER_MISSING')) primaryDiagnostic = 'B2C_OFFER_MISSING';
+    else if (diagnosticSignals.includes('B2C_PRICE_MISSING_OR_INVALID')) primaryDiagnostic = 'B2C_PRICE_MISSING_OR_INVALID';
+    else if (diagnosticSignals.includes('PURCHASABLE_OFFER_ATTRIBUTE_MISSING')) primaryDiagnostic = 'PURCHASABLE_OFFER_ATTRIBUTE_MISSING';
+    else if (diagnosticSignals.includes('SKIP_OFFER_TRUE')) primaryDiagnostic = 'SKIP_OFFER_TRUE';
+    else if (diagnosticSignals.includes('CONDITION_TYPE_MISSING')) primaryDiagnostic = 'CONDITION_TYPE_MISSING';
+    else primaryDiagnostic = 'NO_BLOCKING_SIGNAL_AFTER_DEEP_GET';
+  }
+
+  return {
+    sku: String(raw?.sku || initial.sku || '').trim(),
+    asin: String(summary.asin || initial.asin || '').trim(),
+    title: String(summary.itemName || initial.title || '').trim(),
+    productType: String(summary.productType || initial.productType || '').trim(),
+    initialReasonClass: initial.reasonClass,
+    initialStatus: splitStatuses(initial.status),
+    initialAvailableQuantity: initial.availableQuantity,
+    deepFetchOk: true,
+    deepStatus: statuses,
+    deepBuyable: statuses.includes('BUYABLE'),
+    deepDiscoverable: statuses.includes('DISCOVERABLE'),
+    deepAvailableQuantity: availableQuantity,
+    fulfillmentAvailability: availability,
+    issueCount: issues.length,
+    errorCount: errorIssues.length,
+    warningCount: warningIssues.length,
+    enforcementActions,
+    issues: issues.map(x => ({
+      code: String(x?.code || ''),
+      severity: String(x?.severity || ''),
+      message: String(x?.message || ''),
+      attributeNames: Array.isArray(x?.attributeNames) ? x.attributeNames : [],
+      categories: Array.isArray(x?.categories) ? x.categories : []
+    })),
+    offerSnapshot: {
+      b2cPresent: Boolean(b2cOffer),
+      b2cPrice,
+      b2cPoints: finiteNumberOrNull(b2cOffer?.points?.pointsNumber),
+      b2bPresent: Boolean(b2bOffer),
+      b2bPrice,
+      rawOffers: offers
+    },
+    attributeSnapshot: {
+      conditionType,
+      skipOfferValue: skipOfferValue ?? null,
+      skipOfferTrue,
+      purchasableOfferPresent: purchasableOfferRows.length > 0,
+      purchasableOfferRows,
+      fulfillmentAvailabilityAttributePresent: fulfillmentAttributeRows.length > 0,
+      fulfillmentAvailabilityAttributeRows: fulfillmentAttributeRows,
+      merchantShippingGroup,
+      listPrice,
+      mainProductImagePresent: mainImage.length > 0,
+      mainProductImageRows: mainImage
+    },
+    rootCauseConfirmed,
+    primaryDiagnostic,
+    diagnosticSignals: uniqueStrings(diagnosticSignals),
+    createdDate: String(summary.createdDate || ''),
+    lastUpdatedDate: String(summary.lastUpdatedDate || '')
+  };
+}
+
 function extractMediaAttributes(attributes) {
   const out = {};
   if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) return out;
@@ -347,6 +590,16 @@ function collectKnownEnforcements(issues) {
 
 function uniqueStrings(values) {
   return [...new Set((values || []).map(x => String(x || '').trim()).filter(Boolean))];
+}
+
+function splitStatuses(value) {
+  if (Array.isArray(value)) return value.map(x => String(x || '').trim()).filter(Boolean);
+  return String(value || '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function finiteNumberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function waitAuditMs(ms) {

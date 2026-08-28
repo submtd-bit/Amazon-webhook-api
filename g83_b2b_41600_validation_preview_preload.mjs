@@ -380,6 +380,7 @@ function summarizeIssues(issues) {
 }
 
 async function handler(req, res) {
+  let validationPreviewCalls = 0;
   try {
     const secret = getSecret();
     if (!secret) return res.status(500).json({ ok: false, moduleVersion: MODULE_VERSION, route: ROUTE, decision: "CONFIG_ERROR", externalChanges: 0, error: "AMAZON_STOCK_API_SECRET is not set" });
@@ -397,7 +398,7 @@ async function handler(req, res) {
         decision: "PREFLIGHT_BLOCKED_NO_VALIDATION_CALL",
         preflightPassed: 0,
         preflightFailed: 1,
-        validationPreviewCalls: 0,
+        validationPreviewCalls,
         persistentAmazonWrites: 0,
         liveCalls: 0,
         externalChanges: 0,
@@ -418,6 +419,7 @@ async function handler(req, res) {
 
     const built = buildTargetOffers(state);
     const validation = await validationPreview(accessToken, state.productType, built.offers);
+    validationPreviewCalls = 1;
     if (validation.errors.length) {
       return res.status(422).json({
         ok: false,
@@ -426,7 +428,7 @@ async function handler(req, res) {
         decision: "VALIDATION_PREVIEW_G83_B2B_41600_FAILED",
         preflightPassed: 1,
         preflightFailed: 0,
-        validationPreviewCalls: 1,
+        validationPreviewCalls,
         validationPassedCount: 0,
         validationFailedCount: 1,
         persistentAmazonWrites: 0,
@@ -448,7 +450,7 @@ async function handler(req, res) {
       approvedCount: 1,
       preflightPassed: 1,
       preflightFailed: 0,
-      validationPreviewCalls: 1,
+      validationPreviewCalls,
       validationPassedCount: 1,
       validationFailedCount: 0,
       persistentAmazonWrites: 0,
@@ -464,7 +466,7 @@ async function handler(req, res) {
         currentB2B: TARGET.currentB2B,
         targetB2B: TARGET.targetB2B,
         quantityPlan: state.quantityPlan,
-        quantityEffectivePriceRaw,
+        quantityEffectivePriceRaw: quantityEffectiveRaw,
         availableQuantity: state.availableQuantity,
         mutationMode: "REPLACE_B2B_OUR_PRICE_ONLY",
         preservation: built.preservation,
@@ -485,7 +487,7 @@ async function handler(req, res) {
       moduleVersion: MODULE_VERSION,
       route: ROUTE,
       decision: "ERROR_BEFORE_LIVE_NO_MUTATION",
-      validationPreviewCalls: 0,
+      validationPreviewCalls,
       persistentAmazonWrites: 0,
       liveCalls: 0,
       externalChanges: 0,

@@ -3,7 +3,7 @@ import fetch from "node-fetch";
 import "dotenv/config";
 
 /**
- * Amazon B2B six-SKU explicit-price Validation Preview v1.2.0
+ * Amazon B2B six-SKU explicit-price Validation Preview v1.2.1
  * 2026-08-29
  *
  * VALIDATION_PREVIEW ONLY.
@@ -13,12 +13,14 @@ import "dotenv/config";
  * even when attributes.purchasable_offer has no explicit B2B row. Therefore this
  * route treats actualOffer B2B as authoritative current state and supports both:
  *   - explicit B2B attribute already present -> replace its our_price
+ *   - explicit B2B attribute present without our_price -> preserve the B2B row and
+ *     seed only its missing our_price structure from the consumer offer
  *   - actual B2B offer present but explicit attribute absent -> append explicit B2B row
  *
  * Quantity discounts are not added or changed.
  * No persistent Amazon mutation; externalChanges=0.
  */
-const MODULE_VERSION = "2026-08-29-amazon-b2b-six-validation-preview-v1.2.0";
+const MODULE_VERSION = "2026-08-29-amazon-b2b-six-validation-preview-v1.2.1";
 const ROUTE = "/amazon/price/b2b/six-create-validation-preview";
 const BATCH_TOKEN = "AMAZON_B2B_6_CREATE_20260827_V1";
 const REQUEST_TIMEOUT_MS = 20000;
@@ -148,20 +150,29 @@ function analyze(approved,listing,now){
   if(max!==null&&approved.targetB2b>max)blocks.push(`TARGET_ABOVE_MAX:${approved.targetB2b}>${max}`);
   return {approved,asin:String(summary?.asin||""),productType:String(summary?.productType||""),statuses,buyable:statuses.includes("BUYABLE"),errorCount:errors.length,qty,offers,consumer,b2bIndex:b2bs.length===1?b2bs[0].index:-1,b2bAttribute:b2bs.length===1?b2bs[0].offer:null,consumerState:{normal,sale,effective,min,max},actual,blocks};
 }
-function setOfferPrice(offer,target){
-  if(!Array.isArray(offer.our_price)||!offer.our_price.length)throw new Error("our_price missing");
-  const first=JSON.parse(JSON.stringify(offer.our_price[0]||{}));
+function priceTemplateFrom(offer){
+  return Array.isArray(offer?.our_price)&&offer.our_price.length?JSON.parse(JSON.stringify(offer.our_price[0]||{})):null;
+}
+function setOfferPrice(offer,target,templateOffer){
+  const ownTemplate=priceTemplateFrom(offer),fallbackTemplate=priceTemplateFrom(templateOffer),first=ownTemplate||fallbackTemplate;
+  if(!first)throw new Error("our_price template missing");
   first.schedule=[{value_with_tax:target}];
   offer.our_price=[first];
+  return ownTemplate?"OWN_OUR_PRICE":"SEEDED_OUR_PRICE_FROM_CONSUMER";
 }
 function buildOffers(state){
   const offers=JSON.parse(JSON.stringify(state.offers));
-  let b2b,mode;
-  if(state.b2bIndex>=0){b2b=JSON.parse(JSON.stringify(offers[state.b2bIndex]));setOfferPrice(b2b,state.approved.targetB2b);offers[state.b2bIndex]=b2b;mode="REPLACE_EXPLICIT_B2B_ATTRIBUTE";}
+  let b2b,mode,priceMode;
+  if(state.b2bIndex>=0){
+    b2b=JSON.parse(JSON.stringify(offers[state.b2bIndex]));
+    priceMode=setOfferPrice(b2b,state.approved.targetB2b,state.consumer);
+    offers[state.b2bIndex]=b2b;
+    mode=priceMode==="OWN_OUR_PRICE"?"REPLACE_EXPLICIT_B2B_ATTRIBUTE":"REPLACE_EXPLICIT_B2B_ATTRIBUTE_SEEDED_OUR_PRICE";
+  }
   else {
     b2b=JSON.parse(JSON.stringify(state.consumer));b2b.audience="B2B";
     delete b2b.discounted_price;delete b2b.minimum_seller_allowed_price;delete b2b.maximum_seller_allowed_price;delete b2b.quantity_discount_plan;
-    setOfferPrice(b2b,state.approved.targetB2b);offers.push(b2b);mode="APPEND_EXPLICIT_B2B_ATTRIBUTE";
+    setOfferPrice(b2b,state.approved.targetB2b,state.consumer);offers.push(b2b);mode="APPEND_EXPLICIT_B2B_ATTRIBUTE";
   }
   return {offers,b2b,mode};
 }
@@ -176,16 +187,23 @@ async function handler(req,res){
     for(const approved of APPROVED)states.push(analyze(approved,await getListing(at,approved.sku),now));
     const failures=states.filter(s=>s.blocks.length).map(s=>({sku:s.approved.sku,asin:s.approved.asin,blocks:s.blocks}));
     if(failures.length)return res.status(409).json({ok:false,moduleVersion:MODULE_VERSION,route:ROUTE,decision:"PREFLIGHT_BLOCKED_NO_VALIDATION_CALLS",approvedCount:6,preflightPassed:6-failures.length,preflightFailed:failures.length,validationPreviewCalls:0,persistentAmazonWrites:0,liveCalls:0,externalChanges:0,failures});
-    const results=[];let passed=0;
+    const results=[];let passed=0,validationCalls=0;
     for(const state of states){
-      const built=buildOffers(state);
+      let built=null;
       try{
+        built=buildOffers(state);
+      }catch(err){
+        results.push({sku:state.approved.sku,asin:state.approved.asin,currentActualB2bPrice:state.actual.b2bPrice,targetB2bPrice:state.approved.targetB2b,attributeMode:"BUILD_FAILED",validationPassed:false,buildError:err?.message||String(err)});
+        continue;
+      }
+      try{
+        validationCalls++;
         const preview=await validationPreview(at,state.approved.sku,state.productType,built.offers),issues=summarizeValidation(preview.result),errs=issues.filter(i=>i.severity.toUpperCase()==="ERROR"),ok=errs.length===0;if(ok)passed++;
         results.push({sku:state.approved.sku,asin:state.approved.asin,currentActualB2bPrice:state.actual.b2bPrice,targetB2bPrice:state.approved.targetB2b,currentMinimum:state.consumerState.min,currentEffectivePrice:state.consumerState.effective,amazonPoints:state.actual.points,availableQuantity:state.qty,attributeMode:built.mode,validationPassed:ok,validationStatus:String(preview.result?.status||""),submissionId:String(preview.result?.submissionId||""),issues});
       }catch(err){results.push({sku:state.approved.sku,asin:state.approved.asin,currentActualB2bPrice:state.actual.b2bPrice,targetB2bPrice:state.approved.targetB2b,attributeMode:built.mode,validationPassed:false,transportError:err?.message||String(err),amazonBody:err?.amazonBody||null});}
     }
-    const all=passed===6;
-    return res.status(all?200:409).json({ok:all,moduleVersion:MODULE_VERSION,route:ROUTE,decision:all?"VALIDATION_PREVIEW_ALL_6_PASSED":"VALIDATION_PREVIEW_FAILED_REVIEW_REQUIRED",approvedCount:6,preflightPassed:6,preflightFailed:0,validationPreviewCalls:6,validationPassedCount:passed,validationFailedCount:6-passed,persistentAmazonWrites:0,liveCalls:0,externalChanges:0,results});
+    const all=passed===6&&validationCalls===6;
+    return res.status(all?200:409).json({ok:all,moduleVersion:MODULE_VERSION,route:ROUTE,decision:all?"VALIDATION_PREVIEW_ALL_6_PASSED":"VALIDATION_PREVIEW_FAILED_REVIEW_REQUIRED",approvedCount:6,preflightPassed:6,preflightFailed:0,validationPreviewCalls:validationCalls,validationPassedCount:passed,validationFailedCount:6-passed,persistentAmazonWrites:0,liveCalls:0,externalChanges:0,results});
   } catch(err){console.error("B2B six validation preview error",err);return res.status(500).json({ok:false,moduleVersion:MODULE_VERSION,route:ROUTE,decision:"ERROR",error:err?.message||String(err),validationPreviewCalls:0,persistentAmazonWrites:0,liveCalls:0,externalChanges:0});}
 }
 

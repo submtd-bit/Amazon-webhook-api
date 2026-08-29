@@ -3,8 +3,8 @@ import fetch from "node-fetch";
 import "dotenv/config";
 
 /**
- * Amazon B2B six-SKU explicit-price Validation Preview v1.1.0
- * 2026-08-27
+ * Amazon B2B six-SKU explicit-price Validation Preview v1.2.0
+ * 2026-08-29
  *
  * VALIDATION_PREVIEW ONLY.
  *
@@ -18,7 +18,7 @@ import "dotenv/config";
  * Quantity discounts are not added or changed.
  * No persistent Amazon mutation; externalChanges=0.
  */
-const MODULE_VERSION = "2026-08-27-amazon-b2b-six-validation-preview-v1.1.0";
+const MODULE_VERSION = "2026-08-29-amazon-b2b-six-validation-preview-v1.2.0";
 const ROUTE = "/amazon/price/b2b/six-create-validation-preview";
 const BATCH_TOKEN = "AMAZON_B2B_6_CREATE_20260827_V1";
 const REQUEST_TIMEOUT_MS = 20000;
@@ -28,7 +28,7 @@ const originalListen = express.application.listen;
 
 const APPROVED = Object.freeze([
   Object.freeze({ sku: "LeLib_SV1_16gb_256", asin: "B0G59QKJXB", normal: 60000, effective: 60000, points: 600, min: 40500, currentActualB2b: 58212, targetB2b: 57000 }),
-  Object.freeze({ sku: "RB-Y7G2-H0EK", asin: "B0GZGM1BND", normal: 56000, effective: 52800, points: 560, min: 40500, currentActualB2b: 54363, targetB2b: 51200 }),
+  Object.freeze({ sku: "RB-Y7G2-H0EK", asin: "B0GZGM1BND", normal: 56000, effective: 56000, points: 560, min: 40500, currentActualB2b: 54363, targetB2b: 53200 }),
   Object.freeze({ sku: "LeLib_SV1_16GB_SSD512", asin: "B0G5ZRLZZH", normal: 68000, effective: 68000, points: 680, min: 54900, currentActualB2b: 65974, targetB2b: 64600 }),
   Object.freeze({ sku: "ZK-N79H-VRJQ", asin: "B0D4QMJK1Z", normal: 32000, effective: 32000, points: 320, min: 30300, currentActualB2b: 31046, targetB2b: 30400 }),
   Object.freeze({ sku: "FU-OAHV-H4W4", asin: "B0H211KYDG", normal: 65000, effective: 65000, points: 650, min: 27900, currentActualB2b: 63063, targetB2b: 61700 }),

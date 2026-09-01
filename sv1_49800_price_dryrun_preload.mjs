@@ -3,27 +3,34 @@ import fetch from "node-fetch";
 import "dotenv/config";
 
 /**
- * CF-SV1 RB-Y7G2-H0EK guarded PRICE TEST dry-run v1.0.0
- * READ/VALIDATION_PREVIEW ONLY. No LIVE route exists in this module.
+ * CF-SV1 RB-Y7G2-H0EK guarded PRICE TEST dry-run v1.0.1
+ * READ + Listings VALIDATION_PREVIEW only. No LIVE route exists.
  *
- * Exact intended proposal:
- * - B2C normal: 56,000 -> 49,800
- * - B2B: 53,200 -> 47,300 (5% off 49,800, floor 100 JPY)
- * - Preserve Amazon minimum seller allowed: 40,500
- * - Internal review floor: 41,600
- * - Preserve points: current exact Product Pricing seller offer must show 560
- * - Preserve inactive/expired sale schedules and every other purchasable_offer field
- * - Quantity discount must remain absent
- * - Never touches Amazon Ads / Yahoo / inventory
+ * Proposal under review:
+ * - B2C normal 56,000 -> 49,800
+ * - B2B 53,200 -> 47,300
+ * - preserve Amazon minimum 40,500
+ * - internal review floor 41,600
+ * - exact Product Pricing seller offer must be 56,000 / 560 points
+ * - quantity discount remains absent
+ * - no Amazon Ads / Yahoo / inventory mutation
+ *
+ * v1.0.1 quota hardening:
+ * - long fail-closed 429 backoff
+ * - a cooldown before Product Pricing
+ * - exactly ONE Product Pricing request in the DRY transaction
+ * - post-preview non-mutation is verified through fresh Listings state
  */
 
-const MODULE_VERSION = "2026-09-01-sv1-49800-price-dryrun-v1.0.0";
+const MODULE_VERSION = "2026-09-01-sv1-49800-price-dryrun-v1.0.1";
 const ROUTE = "/amazon/price/sv1-49800/dry-run";
 const MARKETPLACE_ID = "A1VC38T7YXB528";
 const ITEM_CONDITION = "New";
 const REQUEST_TIMEOUT_MS = 20000;
-const MAX_RETRIES = 3;
-const RETRY_BASE_MS = 800;
+const MAX_RETRIES = 5;
+const QUOTA_BACKOFF_MS = [15000, 30000, 60000, 90000];
+const PRODUCT_PRICING_COOLDOWN_MS = 20000;
+const POST_PREVIEW_SETTLE_MS = 2500;
 const originalUse = express.application.use;
 const originalPost = express.application.post;
 
@@ -43,7 +50,6 @@ const TARGET = Object.freeze({
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function clone(v) { return JSON.parse(JSON.stringify(v)); }
 function jsonEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
-function hasOwn(o, k) { return Boolean(o) && Object.prototype.hasOwnProperty.call(o, k); }
 function numberOrNull(v) {
   if (v === null || v === undefined || v === "") return null;
   if (typeof v === "object") {
@@ -85,14 +91,15 @@ async function getLwaAccessToken() {
   if (!clientId || !clientSecret || !refreshToken) throw new Error("Missing LWA env");
   const response = await fetch("https://api.amazon.com/auth/o2/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: { "Content-Type":"application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type:"refresh_token", refresh_token:refreshToken, client_id:clientId, client_secret:clientSecret }),
   });
   const json = safeJsonParse(await response.text());
   if (!response.ok || !json.access_token) throw new Error(`LWA token error: ${response.status}`);
   return json.access_token;
 }
-async function amazonRequest(method, url, accessToken, body) {
+
+async function amazonRequest(method, url, accessToken, body, audit) {
   let lastError = null;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
     const controller = new AbortController();
@@ -105,35 +112,59 @@ async function amazonRequest(method, url, accessToken, body) {
           accept: "application/json",
           ...(body ? { "content-type":"application/json" } : {}),
         },
-        ...(body ? { body: JSON.stringify(body) } : {}),
+        ...(body ? { body:JSON.stringify(body) } : {}),
         signal: controller.signal,
       });
       const text = await response.text();
       const json = safeJsonParse(text);
       if (response.ok) return json;
-      const retryable = response.status === 429 || response.status >= 500;
-      if (!retryable || attempt === MAX_RETRIES) throw new Error(`SP-API ${method} ${response.status}: ${JSON.stringify(json).slice(0,2500)}`);
-      const retryAfter = Number(response.headers.get("retry-after"));
-      await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : RETRY_BASE_MS * attempt);
+
+      if (response.status === 429) {
+        audit.quota429Count += 1;
+        if (attempt === MAX_RETRIES) throw new Error(`SP-API ${method} 429: ${JSON.stringify(json).slice(0,2500)}`);
+        const retryAfter = Number(response.headers.get("retry-after"));
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.ceil(retryAfter * 1000)
+          : QUOTA_BACKOFF_MS[Math.min(attempt - 1, QUOTA_BACKOFF_MS.length - 1)];
+        audit.quotaWaitMs += waitMs;
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (response.status >= 500 && attempt < MAX_RETRIES) {
+        const waitMs = Math.min(10000, 1500 * attempt);
+        audit.serverRetryCount += 1;
+        await sleep(waitMs);
+        continue;
+      }
+
+      throw new Error(`SP-API ${method} ${response.status}: ${JSON.stringify(json).slice(0,2500)}`);
     } catch (err) {
       lastError = err;
       if (attempt === MAX_RETRIES) throw err;
-      await sleep(RETRY_BASE_MS * attempt);
+      if (String(err?.message || "").includes("SP-API ")) throw err;
+      const waitMs = Math.min(10000, 1500 * attempt);
+      audit.networkRetryCount += 1;
+      await sleep(waitMs);
     } finally {
       clearTimeout(timer);
     }
   }
   throw lastError || new Error("SP-API request failed");
 }
-async function getListing(accessToken) {
+
+async function getListing(accessToken, audit) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
   const q = new URLSearchParams({ marketplaceIds:marketplaceId, includedData:"summaries,attributes,issues,offers,fulfillmentAvailability", issueLocale:"ja_JP" });
-  return amazonRequest("GET", `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(TARGET.sku)}?${q}`, accessToken);
+  audit.listingsGetCalls += 1;
+  return amazonRequest("GET", `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(TARGET.sku)}?${q}`, accessToken, null, audit);
 }
-async function getExactSellerOffer(accessToken) {
+
+async function getExactSellerOffer(accessToken, audit) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
   const body = { requests:[{ uri:`/products/pricing/v0/items/${encodeURIComponent(TARGET.asin)}/offers`, method:"GET", MarketplaceId:marketplaceId, ItemCondition:ITEM_CONDITION, CustomerType:"Consumer" }] };
-  const json = await amazonRequest("POST", `${endpoint}/batches/products/pricing/v0/itemOffers`, accessToken, body);
+  audit.productPricingCalls += 1;
+  const json = await amazonRequest("POST", `${endpoint}/batches/products/pricing/v0/itemOffers`, accessToken, body, audit);
   const batch = (json?.responses || json?.Responses || [])[0] || {};
   const status = typeof batch?.status === "number" ? batch.status : (batch?.status?.statusCode ?? batch?.Status?.StatusCode ?? batch?.statusCode ?? null);
   const b = batch?.body || batch?.Body || {};
@@ -154,28 +185,26 @@ async function getExactSellerOffer(accessToken) {
       subCondition: String(o?.SubCondition || o?.subCondition || ""),
     };
   }).filter(o => o.listingPrice !== null);
-  const selected = ours.find(o => o.isBuyBoxWinner) || ours[0] || null;
-  return { httpStatus:status, ourOfferCount:ours.length, selected };
+  return { httpStatus:status, ourOfferCount:ours.length, selected:ours.find(o => o.isBuyBoxWinner) || ours[0] || null };
 }
+
 function audienceValue(o) {
   if (!o) return "";
   if (typeof o.audience === "string") return String(o.audience).toUpperCase();
   return String(o?.audience?.value || o?.audience?.displayName || "").toUpperCase();
 }
-function offerType(o) { return String(o?.offerType || o?.offer_type || "").toUpperCase(); }
 function activeScheduleRef(offer, key, nowMs) {
   const groups = Array.isArray(offer?.[key]) ? offer[key] : [];
   const candidates = [];
-  groups.forEach((g, gi) => (Array.isArray(g?.schedule) ? g.schedule : []).forEach((s, si) => {
-    if (scheduleIsActive(s, nowMs)) candidates.push({ groupIndex:gi, scheduleIndex:si, schedule:s, startMs:epochOrNull(s?.start_at) ?? 0 });
+  groups.forEach((g,gi) => (Array.isArray(g?.schedule) ? g.schedule : []).forEach((s,si) => {
+    if (scheduleIsActive(s,nowMs)) candidates.push({ groupIndex:gi, scheduleIndex:si, schedule:s, startMs:epochOrNull(s?.start_at) ?? 0 });
   }));
   candidates.sort((a,b) => b.startMs - a.startMs);
   return candidates[0] || null;
 }
 function activeScheduleCount(offer, key, nowMs) {
-  const groups = Array.isArray(offer?.[key]) ? offer[key] : [];
   let count = 0;
-  groups.forEach(g => (Array.isArray(g?.schedule) ? g.schedule : []).forEach(s => { if (scheduleIsActive(s, nowMs)) count += 1; }));
+  (Array.isArray(offer?.[key]) ? offer[key] : []).forEach(g => (Array.isArray(g?.schedule) ? g.schedule : []).forEach(s => { if (scheduleIsActive(s,nowMs)) count += 1; }));
   return count;
 }
 function analyzeListing(listing, nowMs = Date.now()) {
@@ -207,7 +236,8 @@ function analyzeListing(listing, nowMs = Date.now()) {
     quantityDiscountActiveCount:activeScheduleCount(b2b,"quantity_discount_plan",nowMs),
   };
 }
-function preflightBlocks(state, pricing) {
+
+function stateBlocks(state) {
   const b = [];
   if (state.asin !== TARGET.asin) b.push(`ASIN_MISMATCH:${state.asin}`);
   if (!state.productType) b.push("PRODUCT_TYPE_MISSING");
@@ -225,6 +255,10 @@ function preflightBlocks(state, pricing) {
   if (TARGET.targetNormal < TARGET.internalReviewFloor) b.push("TARGET_NORMAL_BELOW_REVIEW_FLOOR");
   if (TARGET.targetB2B < TARGET.minimumSellerAllowed) b.push("TARGET_B2B_BELOW_AMAZON_MIN");
   if (Math.floor((TARGET.targetNormal * 0.95) / 100) * 100 !== TARGET.targetB2B) b.push("B2B_TARGET_FORMULA_MISMATCH");
+  return b;
+}
+function pricingBlocks(pricing) {
+  const b = [];
   if (!pricing?.selected) b.push(`PRODUCT_PRICING_SELLER_OFFER_ABSENT:http=${pricing?.httpStatus ?? "NA"}`);
   if (pricing?.selected?.listingPrice !== TARGET.currentNormal) b.push(`PRODUCT_PRICING_PRICE_DRIFT:${pricing?.selected?.listingPrice}`);
   if (pricing?.selected?.points !== TARGET.pointsBefore) b.push(`PRODUCT_PRICING_POINTS_DRIFT:${pricing?.selected?.points}`);
@@ -240,49 +274,53 @@ function buildPreview(state) {
   if (!cRef || !bRef) throw new Error("ACTIVE_PRICE_SCHEDULE_MISSING_WHILE_BUILDING_PREVIEW");
   c.our_price[cRef.groupIndex].schedule[cRef.scheduleIndex].value_with_tax = TARGET.targetNormal;
   b.our_price[bRef.groupIndex].schedule[bRef.scheduleIndex].value_with_tax = TARGET.targetB2B;
-
   const restored = clone(after);
   restored[state.consumerIndex].our_price[cRef.groupIndex].schedule[cRef.scheduleIndex].value_with_tax = TARGET.currentNormal;
   restored[state.b2bIndex].our_price[bRef.groupIndex].schedule[bRef.scheduleIndex].value_with_tax = TARGET.currentB2B;
   if (!jsonEqual(restored,before)) throw new Error("PREVIEW_SCOPE_EXCEEDED_TWO_PRICE_LEAVES");
-
   return { productType:state.productType, patches:[{ op:"replace", path:"/attributes/purchasable_offer", value:after }] };
 }
-async function validationPreview(accessToken, productType, patchBody) {
+async function validationPreview(accessToken, patchBody, audit) {
   const { sellerId, marketplaceId, endpoint } = getConfig();
   const q = new URLSearchParams({ marketplaceIds:marketplaceId, issueLocale:"ja_JP", mode:"VALIDATION_PREVIEW" });
-  const json = await amazonRequest("PATCH", `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(TARGET.sku)}?${q}`, accessToken, patchBody);
+  audit.validationPreviewCalls += 1;
+  const json = await amazonRequest("PATCH", `${endpoint}/listings/2021-08-01/items/${encodeURIComponent(sellerId)}/${encodeURIComponent(TARGET.sku)}?${q}`, accessToken, patchBody, audit);
   const issues = Array.isArray(json?.issues) ? json.issues : [];
-  const errors = issues.filter(x => String(x?.severity || "").toUpperCase() === "ERROR");
-  return { json, issues, errors };
+  return { json, issues, errors:issues.filter(x => String(x?.severity || "").toUpperCase() === "ERROR") };
 }
-function summarizeState(state) {
-  return { normalPrice:state.normalPrice, b2bPrice:state.b2bPrice, minimumSellerAllowed:state.minimumSellerAllowed, activeSalePrice:state.salePrice, quantityDiscountActiveCount:state.quantityDiscountActiveCount, availableQuantity:state.availableQuantity, statuses:state.statuses, errorCount:state.errorCount };
+function summarizeState(s) {
+  return { normalPrice:s.normalPrice, b2bPrice:s.b2bPrice, minimumSellerAllowed:s.minimumSellerAllowed, activeSalePrice:s.salePrice, quantityDiscountActiveCount:s.quantityDiscountActiveCount, availableQuantity:s.availableQuantity, statuses:s.statuses, errorCount:s.errorCount };
 }
+
 async function handler(req,res) {
+  const audit = { productPricingCalls:0, listingsGetCalls:0, validationPreviewCalls:0, quota429Count:0, quotaWaitMs:0, serverRetryCount:0, networkRetryCount:0 };
   try {
     const secret = getSecret();
-    if (!secret) return res.status(500).json({ ok:false, status:"SECRET_MISSING", externalChanges:0 });
-    if (String(req.headers?.["x-api-secret"] || "") !== secret) return res.status(401).json({ ok:false, status:"UNAUTHORIZED", externalChanges:0 });
+    if (!secret) return res.status(500).json({ ok:false, status:"SECRET_MISSING", moduleVersion:MODULE_VERSION, audit, liveCalls:0, externalChanges:0 });
+    if (String(req.headers?.["x-api-secret"] || "") !== secret) return res.status(401).json({ ok:false, status:"UNAUTHORIZED", moduleVersion:MODULE_VERSION, audit, liveCalls:0, externalChanges:0 });
     const body = req.body || {};
     if (body.dryRun !== true || String(body.sku || "") !== TARGET.sku || String(body.asin || "") !== TARGET.asin || Number(body.targetNormal) !== TARGET.targetNormal || Number(body.targetB2B) !== TARGET.targetB2B) {
-      return res.status(400).json({ ok:false, status:"EXACT_SCOPE_REJECTED", moduleVersion:MODULE_VERSION, externalChanges:0 });
+      return res.status(400).json({ ok:false, status:"EXACT_SCOPE_REJECTED", moduleVersion:MODULE_VERSION, audit, liveCalls:0, externalChanges:0 });
     }
 
     const accessToken = await getLwaAccessToken();
-    const before = analyzeListing(await getListing(accessToken));
-    const pricingBefore = await getExactSellerOffer(accessToken);
-    const blocks = preflightBlocks(before,pricingBefore);
-    if (blocks.length) return res.status(409).json({ ok:false, status:"PREFLIGHT_BLOCKED", moduleVersion:MODULE_VERSION, blocks, before:summarizeState(before), productPricing:pricingBefore, validationPreviewCalls:0, liveCalls:0, externalChanges:0 });
+    const before = analyzeListing(await getListing(accessToken,audit));
+    const beforeBlocks = stateBlocks(before);
+    if (beforeBlocks.length) return res.status(409).json({ ok:false, status:"PREFLIGHT_BLOCKED", moduleVersion:MODULE_VERSION, blocks:beforeBlocks, before:summarizeState(before), audit, liveCalls:0, externalChanges:0 });
+
+    await sleep(PRODUCT_PRICING_COOLDOWN_MS);
+    const pricingBefore = await getExactSellerOffer(accessToken,audit);
+    const ppBlocks = pricingBlocks(pricingBefore);
+    if (ppBlocks.length) return res.status(409).json({ ok:false, status:"PRODUCT_PRICING_BLOCKED", moduleVersion:MODULE_VERSION, blocks:ppBlocks, before:summarizeState(before), productPricingBefore:pricingBefore, audit, liveCalls:0, externalChanges:0 });
 
     const patchBody = buildPreview(before);
-    const preview = await validationPreview(accessToken,before.productType,patchBody);
-    if (preview.errors.length) return res.status(422).json({ ok:false, status:"VALIDATION_PREVIEW_FAILED_NO_MUTATION", moduleVersion:MODULE_VERSION, validationIssues:preview.issues, validationPreviewCalls:1, liveCalls:0, externalChanges:0 });
+    const preview = await validationPreview(accessToken,patchBody,audit);
+    if (preview.errors.length) return res.status(422).json({ ok:false, status:"VALIDATION_PREVIEW_FAILED_NO_MUTATION", moduleVersion:MODULE_VERSION, validationIssues:preview.issues, audit, liveCalls:0, externalChanges:0 });
 
-    const after = analyzeListing(await getListing(accessToken));
-    const pricingAfter = await getExactSellerOffer(accessToken);
-    const postBlocks = preflightBlocks(after,pricingAfter);
-    if (postBlocks.length) return res.status(409).json({ ok:false, status:"POST_PREVIEW_STATE_DRIFT", moduleVersion:MODULE_VERSION, blocks:postBlocks, after:summarizeState(after), productPricingAfter:pricingAfter, validationPreviewCalls:1, liveCalls:0, externalChanges:0 });
+    await sleep(POST_PREVIEW_SETTLE_MS);
+    const after = analyzeListing(await getListing(accessToken,audit));
+    const postBlocks = stateBlocks(after);
+    if (postBlocks.length) return res.status(409).json({ ok:false, status:"POST_PREVIEW_STATE_DRIFT", moduleVersion:MODULE_VERSION, blocks:postBlocks, after:summarizeState(after), audit, liveCalls:0, externalChanges:0 });
 
     return res.status(200).json({
       ok:true,
@@ -295,16 +333,16 @@ async function handler(req,res) {
       target:{ normalPrice:TARGET.targetNormal, b2bPrice:TARGET.targetB2B, internalReviewFloor:TARGET.internalReviewFloor, minimumSellerAllowed:TARGET.minimumSellerAllowed, pointsPreserved:TARGET.pointsBefore },
       validation:{ status:String(preview.json?.status || ""), issues:preview.issues, errorCount:0 },
       after:summarizeState(after),
-      productPricingAfter:pricingAfter,
-      protections:{ onlyTwoPriceLeavesChangedInPreview:true, amazonMinimumPreserved:true, pointsNotMutated:true, quantityDiscountAbsent:true, liveRouteExists:false, amazonAdsTouched:false, yahooTouched:false },
-      validationPreviewCalls:1,
+      protections:{ onlyTwoPriceLeavesChangedInPreview:true, amazonMinimumPreserved:true, pointsNotMutated:true, quantityDiscountAbsent:true, productPricingCallsExactlyOne:audit.productPricingCalls === 1, liveRouteExists:false, amazonAdsTouched:false, yahooTouched:false },
+      audit,
+      validationPreviewCalls:audit.validationPreviewCalls,
       liveCalls:0,
       readOnly:true,
       externalChanges:0,
     });
   } catch (err) {
     console.error("SV1 49800 dry-run error", err?.message || String(err));
-    return res.status(500).json({ ok:false, status:"ERROR", moduleVersion:MODULE_VERSION, error:err?.message || String(err), validationPreviewCalls:0, liveCalls:0, externalChanges:0 });
+    return res.status(500).json({ ok:false, status:"ERROR", moduleVersion:MODULE_VERSION, error:err?.message || String(err), audit, validationPreviewCalls:audit.validationPreviewCalls, liveCalls:0, externalChanges:0 });
   }
 }
 

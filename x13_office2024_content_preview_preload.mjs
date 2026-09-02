@@ -20,15 +20,15 @@ const GUARD = Object.freeze({
 });
 
 const TARGET = Object.freeze({
-  title: "【整備済み品】Lenovo ThinkPad X13 Gen1 ノートパソコン 13.3型 第10世代 Core i5-10310U メモリ8GB SSD256GB Windows 11 Pro MS Office 2024 ノートン360デラックス付属",
+  title: "【整備済み品】レノボ ThinkPad X13 Gen1 ノートパソコン 13.3型 第10世代 Core i5-10310U メモリ8GB SSD256GB Windows 11 Pro MS Office 2024 ノートン360デラックス付属",
   bulletPoints: [
-    "【第10世代Core i5・メモリ8GB】Intel Core i5-10310Uと8GBメモリを搭載。Web閲覧、文書作成、表計算、Web会議など日常のビジネス用途に対応するモバイルノートPCです。",
+    "【第10世代Core i5・メモリ8GB】インテル Core i5-10310Uと8GBメモリを搭載。Web閲覧、文書作成、表計算、Web会議など日常のビジネス用途に対応するモバイルノートPCです。",
     "【SSD256GB・Windows 11 Pro】256GB SSDとWindows 11 Proを搭載。起動やデータアクセスを軽快にし、仕事や学習用PCとして使いやすい構成です。",
     "【13.3型フルHD・モバイル設計】1920×1080の13.3型フルHDディスプレイを搭載。Webカメラ、Wi-Fi、Bluetooth、USB、Type-C、HDMIに対応しています。",
     "【MS Office 2024・ノートン360デラックス付属】MS Office 2024とノートン360デラックス 1年版を同梱。文書作成・表計算・プレゼン作成やセキュリティ対策に活用できます。",
     "【整備済み・180日保証】専門スタッフが動作確認、初期設定、クリーニングを実施した整備済み品です。自然故障を対象とした180日間の保証付きです。",
   ],
-  description: "MTD整備済みのLenovo ThinkPad X13 Gen1です。第10世代Intel Core i5-10310U、メモリ8GB、SSD256GB、Windows 11 Proを搭載。13.3型フルHD（1920×1080）ディスプレイ、Webカメラ、Wi-Fi、Bluetooth、USB、Type-C、HDMIに対応し、文書作成、表計算、Web会議、学習など幅広い用途に適しています。MS Office 2024とノートン360デラックス 1年版を同梱。専門スタッフによる動作確認、初期設定、クリーニングを行い、自然故障を対象とした180日間の保証を付帯しています。整備済み品のため、外装には使用に伴う擦れや小傷などがある場合があります。",
+  description: "MTD整備済みのレノボ ThinkPad X13 Gen1です。第10世代インテル Core i5-10310U、メモリ8GB、SSD256GB、Windows 11 Proを搭載。13.3型フルHD（1920×1080）ディスプレイ、Webカメラ、Wi-Fi、Bluetooth、USB、Type-C、HDMIに対応し、文書作成、表計算、Web会議、学習など幅広い用途に適しています。MS Office 2024とノートン360デラックス 1年版を同梱。専門スタッフによる動作確認、初期設定、クリーニングを行い、自然故障を対象とした180日間の保証を付帯しています。整備済み品のため、外装には使用に伴う擦れや小傷などがある場合があります。",
   softwareIncluded: ["MS Office 2024", "ノートン360 デラックス 1年版"],
 });
 
@@ -293,8 +293,137 @@ async function handler(req, res) {
   }
 }
 
+const TITLE_PROBE_ROUTE = "/amazon/listing/x13-office2024-title-probe";
+const TITLE_PROBE_VERSION = "2026-09-02-x13-title-probe-v1.0.0";
+
+const TITLE_PROBE = Object.freeze({
+  catalogControl:
+    "【整備済み品】 中古ノートパソコン ThinkPad X13 Gen1 シンクパッド | 中古 PC | 第10世代 Core i5 | メモリ8GB SSD256GB | 13.3インチ | Webカメラ内蔵 | 無線Wifi USB3.0 | Type-C - HDMI | Win11 pro搭載 | WPS Office2搭載",
+  minimalOfficeNorton:
+    "【整備済み品】 中古ノートパソコン ThinkPad X13 Gen1 シンクパッド | 中古 PC | 第10世代 Core i5 | メモリ8GB SSD256GB | 13.3インチ | Webカメラ内蔵 | 無線Wifi USB3.0 | Type-C - HDMI | Win11 pro搭載 | MS Office 2024・ノートン360デラックス付属",
+  recommendedKana:
+    "【整備済み品】レノボ ThinkPad X13 Gen1 ノートパソコン 13.3型 第10世代 Core i5-10310U メモリ8GB SSD256GB Windows 11 Pro MS Office 2024 ノートン360デラックス付属",
+});
+
+function buildTitlePatch(attributes, title) {
+  return {
+    op: "replace",
+    path: "/attributes/item_name",
+    value: buildValueRows(attributes, "item_name", [title]),
+  };
+}
+
+function compactPreviewResult(label, title, result) {
+  return {
+    label,
+    title,
+    httpStatus: result.httpStatus,
+    responseOk: result.responseOk,
+    status: result.status,
+    submissionId: result.submissionId,
+    issueCount: result.issueCount,
+    errorCount: result.errorCount,
+    valid: result.valid,
+    issues: (Array.isArray(result.issues) ? result.issues : []).map(issue => ({
+      code: String(issue?.code || ""),
+      severity: String(issue?.severity || ""),
+      attributeNames: Array.isArray(issue?.attributeNames) ? issue.attributeNames : [],
+      categories: Array.isArray(issue?.categories) ? issue.categories : [],
+      messageHead: String(issue?.message || "").slice(0, 700),
+    })),
+  };
+}
+
+async function titleProbeHandler(req, res) {
+  try {
+    const secret = getSecret();
+    if (!secret) {
+      return res.status(500).json({
+        ok: false,
+        moduleVersion: TITLE_PROBE_VERSION,
+        readOnly: true,
+        validationPreviewOnly: true,
+        amazonPersistentWrites: 0,
+        externalChanges: 0,
+        error: "AMAZON_STOCK_API_SECRET is not set",
+      });
+    }
+    if (String(req.headers["x-api-secret"] || "") !== secret) {
+      return res.status(401).json({
+        ok: false,
+        moduleVersion: TITLE_PROBE_VERSION,
+        readOnly: true,
+        validationPreviewOnly: true,
+        amazonPersistentWrites: 0,
+        externalChanges: 0,
+        error: "Unauthorized",
+      });
+    }
+
+    const sku = String(req.body?.sku || "").trim();
+    if (sku !== GUARD.sku) throw new Error("GUARD_BLOCKED: unexpected SKU");
+
+    const accessToken = await getLwaAccessToken();
+    const listing = await getListing(accessToken, sku);
+    const { summary, attributes } = assertSource(listing);
+
+    const sourceTitle = String(firstValue(attributes, "item_name") || "");
+    const cases = [
+      { label: "seller_source_noop", title: sourceTitle },
+      { label: "amazon_catalog_control", title: TITLE_PROBE.catalogControl },
+      { label: "catalog_minimal_office_norton", title: TITLE_PROBE.minimalOfficeNorton },
+      { label: "recommended_kana", title: TITLE_PROBE.recommendedKana },
+    ];
+
+    const results = [];
+    for (const testCase of cases) {
+      const result = await previewPatch(
+        accessToken,
+        sku,
+        [buildTitlePatch(attributes, testCase.title)],
+      );
+      results.push(compactPreviewResult(testCase.label, testCase.title, result));
+    }
+
+    return res.status(200).json({
+      ok: true,
+      moduleVersion: TITLE_PROBE_VERSION,
+      route: TITLE_PROBE_ROUTE,
+      sku,
+      asin: summary.asin,
+      productType: summary.productType,
+      sourceTitle,
+      sourceSoftware: normalizedValues(attributes, "software_included"),
+      brand: firstValue(attributes, "brand"),
+      manufacturer: firstValue(attributes, "manufacturer"),
+      results,
+      readOnly: true,
+      validationPreviewOnly: true,
+      amazonPersistentWrites: 0,
+      externalChanges: 0,
+    });
+  } catch (err) {
+    console.error("X13 title probe error", err?.message || String(err));
+    return res.status(400).json({
+      ok: false,
+      moduleVersion: TITLE_PROBE_VERSION,
+      route: TITLE_PROBE_ROUTE,
+      readOnly: true,
+      validationPreviewOnly: true,
+      amazonPersistentWrites: 0,
+      externalChanges: 0,
+      error: err?.message || String(err),
+    });
+  }
+}
+
 express.application.listen = function x13Office2024ContentPreviewListen(...args) {
-  const alreadyRegistered = Boolean(this?._router?.stack?.some(layer => layer?.route?.path === ROUTE));
-  if (!alreadyRegistered) this.post(ROUTE, handler);
+  const existingPaths = new Set(
+    (this?._router?.stack || [])
+      .map(layer => layer?.route?.path)
+      .filter(Boolean),
+  );
+  if (!existingPaths.has(ROUTE)) this.post(ROUTE, handler);
+  if (!existingPaths.has(TITLE_PROBE_ROUTE)) this.post(TITLE_PROBE_ROUTE, titleProbeHandler);
   return originalListen.apply(this, args);
 };

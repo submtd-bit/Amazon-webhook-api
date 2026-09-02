@@ -3,7 +3,7 @@ import fetch from "node-fetch";
 import "dotenv/config";
 
 /**
- * Amazon B2B approved-eight exact base-price LIVE v1.0.0
+ * Amazon B2B approved-eight exact base-price LIVE v1.0.1
  * 2026-09-02
  *
  * User-approved scope: exactly eight Seller SKUs.
@@ -19,7 +19,7 @@ import "dotenv/config";
  * 5) If any LIVE call was attempted, caller must never rerun the LIVE batch.
  *    Use the READ ONLY audit route instead.
  */
-const MODULE_VERSION = "2026-09-02-amazon-b2b-approved-eight-live-v1.0.0";
+const MODULE_VERSION = "2026-09-02-amazon-b2b-approved-eight-live-v1.0.1";
 const LIVE_ROUTE = "/amazon/price/b2b/approved-eight/live";
 const AUDIT_ROUTE = "/amazon/price/b2b/approved-eight/audit";
 const LIVE_CONFIRM = "AMAZON_B2B_APPROVED8_LIVE_20260902_V1";
@@ -33,32 +33,32 @@ const originalListen = express.application.listen;
 const APPROVED = Object.freeze([
   Object.freeze({
     sku: "cf-sv8-i5-8gb-ssd256", asin: "B0GH792325",
-    normal: 30000, effective: 30000, points: 300, min: 27000,
+    normal: 30000, effective: 30000, points: 300, min: 27300,
     currentB2b: 44000, targetB2b: 28500, qtyPlan: null,
   }),
   Object.freeze({
     sku: "IB-8QMD-0078", asin: "B0FQCTCH8M",
-    normal: 79000, effective: 79000, points: 790, min: 53000,
+    normal: 79000, effective: 79000, points: 790, min: 61300,
     currentB2b: 76646, targetB2b: 75000, qtyPlan: null,
   }),
   Object.freeze({
     sku: "cf-sv9-i5-8gb-ssd1", asin: "B0GH77Z9M5",
-    normal: 70000, effective: 70000, points: 700, min: 61000,
+    normal: 70000, effective: 70000, points: 700, min: 61100,
     currentB2b: 67914, targetB2b: 66500, qtyPlan: null,
   }),
   Object.freeze({
     sku: "cf-sv9-i5-8gb-ssd256", asin: "B0GH6ZT2X2",
-    normal: 42000, effective: 42000, points: 420, min: 38000,
+    normal: 42000, effective: 42000, points: 420, min: 32200,
     currentB2b: 64000, targetB2b: 39900, qtyPlan: null,
   }),
   Object.freeze({
     sku: "55-4W0H-JKMS", asin: "B0FQCTDLG1",
-    normal: 70000, effective: 70000, points: 700, min: 44000,
+    normal: 70000, effective: 70000, points: 700, min: 46800,
     currentB2b: 67914, targetB2b: 66500, qtyPlan: null,
   }),
   Object.freeze({
     sku: "CH-CIRX-CP7X", asin: "B0FPC2HV45",
-    normal: 46800, effective: 46800, points: 468, min: 44000,
+    normal: 46800, effective: 46800, points: 468, min: 36800,
     currentB2b: 70300, targetB2b: 44400,
     qtyPlan: Object.freeze({
       discountType: "percent",
@@ -70,12 +70,12 @@ const APPROVED = Object.freeze([
   }),
   Object.freeze({
     sku: "g83-i5-11-8gb-ssd256", asin: "B0GN84QRCF",
-    normal: 51000, effective: 51000, points: 510, min: null,
+    normal: 51000, effective: 51000, points: 510, min: 25400,
     currentB2b: 49480, targetB2b: 48400, qtyPlan: null,
   }),
   Object.freeze({
     sku: "latitude5330-i5-12g-16gb-ssd512", asin: "B0HH3ST712",
-    normal: 64800, effective: 64800, points: 648, min: 58320,
+    normal: 64800, effective: 64800, points: 648, min: 51300,
     currentB2b: 62869, targetB2b: 61500, qtyPlan: null,
   }),
 ]);
@@ -323,7 +323,7 @@ function analyze(approved, listing, now = Date.now()) {
     ?? 0;
   const actual = currentOfferSummary(listing);
   const b2bAttributePrice = b2b ? activeScheduleValue(b2b, "our_price", now) : null;
-  const currentAuthorityB2b = b2bAttributePrice !== null ? b2bAttributePrice : actual.b2bPrice;
+  const currentAuthorityB2b = actual.b2bPrice;
   const qtyPlan = b2b ? quantityPlanSummary(b2b) : null;
   return {
     approved,
@@ -372,7 +372,7 @@ function preflightBlocks(state, expectedB2b) {
   if (state.min !== a.min) blocks.push(`MINIMUM_DRIFT:${state.min}`);
   if (state.currentAuthorityB2b !== expectedB2b) blocks.push(`CURRENT_B2B_DRIFT:${state.currentAuthorityB2b}`);
   if (!qtyPlanMatches(state.qtyPlan, a.qtyPlan)) blocks.push(`QUANTITY_PLAN_DRIFT:${JSON.stringify(state.qtyPlan)}`);
-  if (a.targetB2b < (a.min === null ? 0 : a.min)) blocks.push(`TARGET_BELOW_MIN:${a.targetB2b}<${a.min}`);
+  if (a.targetB2b < a.min) blocks.push(`TARGET_BELOW_MIN:${a.targetB2b}<${a.min}`);
   if (state.effective === null || a.targetB2b >= state.effective) blocks.push(`TARGET_NOT_BELOW_EFFECTIVE:${a.targetB2b}>=${state.effective}`);
   return [...new Set(blocks)];
 }

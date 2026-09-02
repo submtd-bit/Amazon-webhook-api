@@ -20,7 +20,7 @@ const GUARD = Object.freeze({
 });
 
 const TARGET = Object.freeze({
-  title: "【整備済み品】レノボ ThinkPad X13 Gen1 ノートパソコン 13.3型 第10世代 Core i5-10310U メモリ8GB SSD256GB Windows 11 Pro MS Office 2024 ノートン360デラックス付属",
+  title: "【整備済み品】 中古ノートパソコン ThinkPad X13 Gen1 シンクパッド | 中古 PC | 第10世代 Core i5 | メモリ8GB SSD256GB | 13.3インチ | Webカメラ内蔵 | 無線Wifi USB3.0 | Type-C - HDMI | Win11 pro搭載 | MS Office 2024・ノートン360デラックス付属",
   bulletPoints: [
     "【第10世代Core i5・メモリ8GB】インテル Core i5-10310Uと8GBメモリを搭載。Web閲覧、文書作成、表計算、Web会議など日常のビジネス用途に対応するモバイルノートPCです。",
     "【SSD256GB・Windows 11 Pro】256GB SSDとWindows 11 Proを搭載。起動やデータアクセスを軽快にし、仕事や学習用PCとして使いやすい構成です。",

@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const MODULE_VERSION = "2026-09-02-x13-office2024-content-live-v1.0.0";
+const MODULE_VERSION = "2026-09-03-x13-office2024-content-live-v1.0.1";
 const ROUTE = "/amazon/listing/x13-office2024-content-live";
 const REQUEST_TIMEOUT_MS = 20000;
 const VERIFY_ATTEMPTS = 8;
@@ -13,8 +13,8 @@ const GUARD = Object.freeze({
   sku: "NY-G14F-GH8Y",
   asin: "B0FMS8XJ3D",
   productType: "NOTEBOOK_COMPUTER",
-  approvedPreviewSubmissionId: "1c55c2a7f79c44dfb5fad4c6fc077371",
-  confirmLive: "CONFIRM_X13_CONTENT_B0FMS8XJ3D_20260902",
+  approvedPreviewSubmissionId: "fe233080406947628469e09375bc3737",
+  confirmLive: "CONFIRM_X13_CONTENT_B0FMS8XJ3D_20260903",
   title: "【整備済み品】 中古ノートパソコン ThinkPad X13 Gen1 シンクパッド | 中古 PC | 第10世代 Core i5 | メモリ8GB SSD256GB | 13.3インチ | Ｗebカメラ付属 | 無線Wifi USB3.0 | Type-C - HDMI | Win11 pro搭載 | WPS Office2搭載",
   brand: "MTD",
   manufacturer: "MTD",
